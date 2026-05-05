@@ -5,12 +5,15 @@ import codecs
 import contextlib as cl
 import errno
 import functools as ft
+import hashlib
+import hmac
 import io
 import json
 import os
 import os.path as op
 import pickle
 import pickletools
+import secrets
 import sqlite3
 import struct
 import tempfile
@@ -38,6 +41,55 @@ class Constant(tuple):
 DBNAME = 'cache.db'
 ENOVAL = Constant('ENOVAL')
 UNKNOWN = Constant('UNKNOWN')
+
+# --- CVE-2025-69872 / GHSA-w8v5-vhqr-4h9v mitigation ----------------------
+#
+# Every pickle blob written by ``Disk`` is wrapped in an HMAC-SHA256
+# envelope so the bytes loaded from disk can be authenticated before
+# ``pickle.load`` is allowed to interpret them.  The envelope format is::
+#
+#     b"DCv1" + HMAC_SHA256(key, payload) + payload
+#
+# where ``payload`` is the original pickle byte string (post
+# ``pickletools.optimize`` for keys, raw for values).  Verification uses
+# ``hmac.compare_digest`` to avoid timing leaks.
+#
+# The signing key is resolved lazily, only when a pickle path is actually
+# exercised, in this order:
+#
+#     1. an explicit ``pickle_key=`` argument to :class:`Disk` /
+#        :class:`Cache` (bytes, ``bytearray``, hex ``str``, ``False`` to
+#        opt out of HMAC, or ``None`` to fall through to the next step);
+#     2. the ``DISKCACHE_PICKLE_KEY`` environment variable (hex-encoded);
+#     3. an auto-generated ``.diskcache_pickle_key`` file inside the
+#        cache directory (mode ``0o600``).  The file fallback emits an
+#        :class:`UnsafePickleWarning` because an attacker who can read
+#        the cache directory can also read the key and forge the HMAC --
+#        it provides corruption detection and defense against
+#        write-only attackers, not against the full advisory threat
+#        model.
+#
+# ``pickle_key=False`` disables HMAC verification entirely and emits an
+# :class:`UnsafePickleWarning`.  This is the explicit escape hatch for
+# reading caches that pre-date this fix; it leaves the process exposed
+# to the original CVE.
+PICKLE_MAGIC = b'DCv1'
+PICKLE_HMAC_SIZE = hashlib.sha256().digest_size  # 32
+PICKLE_HEADER_SIZE = len(PICKLE_MAGIC) + PICKLE_HMAC_SIZE  # 36
+PICKLE_KEY_FILENAME = '.diskcache_pickle_key'
+PICKLE_KEY_ENV = 'DISKCACHE_PICKLE_KEY'
+PICKLE_KEY_MIN_LEN = 16
+_PICKLE_KEY_UNSET = Constant('PICKLE_KEY_UNSET')
+
+
+class UnsafePickleWarning(UserWarning):
+    """Warning emitted when DiskCache cannot enforce pickle HMAC verification.
+
+    Triggered when the signing key is auto-generated inside the cache
+    directory (an attacker with read access can forge envelopes) or when
+    HMAC verification is explicitly disabled via ``pickle_key=False``.
+    See CVE-2025-69872 / GHSA-w8v5-vhqr-4h9v.
+    """
 
 MODE_NONE = 0
 MODE_RAW = 1
@@ -103,17 +155,227 @@ EVICTION_POLICY = {
 class Disk:
     """Cache key and value serialization for SQLite database and files."""
 
-    def __init__(self, directory, min_file_size=0, pickle_protocol=0):
+    def __init__(self, directory, min_file_size=0, pickle_protocol=0,
+                 pickle_key=_PICKLE_KEY_UNSET):
         """Initialize disk instance.
 
         :param str directory: directory path
         :param int min_file_size: minimum size for file use
         :param int pickle_protocol: pickle protocol for serialization
+        :param pickle_key: HMAC key for pickle envelope verification
+            (CVE-2025-69872 mitigation).  Accepts:
+
+            * ``bytes`` / ``bytearray`` of >= 16 bytes -- used directly;
+            * a hex-encoded ``str`` of >= 32 hex chars -- decoded to bytes;
+            * ``False`` -- disable HMAC; emits :class:`UnsafePickleWarning`
+              and reads pre-fix caches as raw pickle (insecure);
+            * ``None`` (or omitted) -- resolve lazily from the
+              ``DISKCACHE_PICKLE_KEY`` environment variable, then from
+              ``<directory>/.diskcache_pickle_key`` (auto-generated with
+              an :class:`UnsafePickleWarning`).
 
         """
         self._directory = directory
         self.min_file_size = min_file_size
         self.pickle_protocol = pickle_protocol
+        # Eagerly validate explicit (non-False, non-None) keys so bad
+        # input fails at construction time instead of on first use.
+        # ``False`` and ``None`` stay lazy so we don't emit warnings or
+        # touch the filesystem for caches that never exercise pickle.
+        if (
+            pickle_key is not _PICKLE_KEY_UNSET
+            and pickle_key is not None
+            and pickle_key is not False
+        ):
+            pickle_key = self._coerce_pickle_key(
+                pickle_key, source='pickle_key argument'
+            )
+        self._pickle_key_arg = pickle_key
+        self._pickle_key_resolved = None
+        self._pickle_key_warned = False
+
+    # -- CVE-2025-69872 / GHSA-w8v5-vhqr-4h9v helpers ----------------------
+
+    def _resolve_pickle_key(self):
+        """Resolve and cache the pickle HMAC key.  Lazy.
+
+        Returns either a ``bytes`` key, or ``False`` when the user has
+        opted out of HMAC verification.  Never returns ``None``.
+        """
+        if self._pickle_key_resolved is not None:
+            return self._pickle_key_resolved
+
+        arg = self._pickle_key_arg
+
+        if arg is False:
+            if not self._pickle_key_warned:
+                warnings.warn(
+                    'DiskCache pickle HMAC verification is disabled '
+                    '(pickle_key=False). The cache directory must be '
+                    'fully trusted; an attacker with write access can '
+                    'achieve arbitrary code execution via '
+                    'CVE-2025-69872.',
+                    UnsafePickleWarning,
+                    stacklevel=4,
+                )
+                self._pickle_key_warned = True
+            self._pickle_key_resolved = False
+            return False
+
+        if arg is not _PICKLE_KEY_UNSET and arg is not None:
+            key = self._coerce_pickle_key(arg, source='pickle_key argument')
+            self._pickle_key_resolved = key
+            return key
+
+        env_value = os.environ.get(PICKLE_KEY_ENV)
+        if env_value:
+            key = self._coerce_pickle_key(
+                env_value, source='%s environment variable' % PICKLE_KEY_ENV
+            )
+            self._pickle_key_resolved = key
+            return key
+
+        key_path = op.join(self._directory, PICKLE_KEY_FILENAME)
+        key = self._read_or_create_pickle_key_file(key_path)
+        if not self._pickle_key_warned:
+            warnings.warn(
+                'DiskCache auto-generated a pickle HMAC key at %r. This '
+                'detects accidental cache corruption but does NOT '
+                'protect against attackers with read access to the '
+                'cache directory (CVE-2025-69872). For stronger '
+                'protection, set the %s environment variable to a '
+                'hex-encoded random key (>= %d bytes), or pass '
+                'pickle_key=... explicitly.'
+                % (key_path, PICKLE_KEY_ENV, PICKLE_KEY_MIN_LEN),
+                UnsafePickleWarning,
+                stacklevel=4,
+            )
+            self._pickle_key_warned = True
+        self._pickle_key_resolved = key
+        return key
+
+    @staticmethod
+    def _coerce_pickle_key(value, source):
+        if isinstance(value, str):
+            try:
+                key = bytes.fromhex(value)
+            except ValueError:
+                raise ValueError(
+                    '%s must be hex-encoded bytes' % source
+                ) from None
+        elif isinstance(value, (bytes, bytearray)):
+            key = bytes(value)
+        else:
+            raise TypeError(
+                '%s must be bytes, bytearray, hex str, False or None; '
+                'got %s' % (source, type(value).__name__)
+            )
+        if len(key) < PICKLE_KEY_MIN_LEN:
+            raise ValueError(
+                '%s must be at least %d bytes (got %d)'
+                % (source, PICKLE_KEY_MIN_LEN, len(key))
+            )
+        return key
+
+    def _read_or_create_pickle_key_file(self, path):
+        # Make sure the cache directory exists; Cache.__init__ usually
+        # already created it but Disk may be used standalone in tests.
+        directory = op.dirname(path) or '.'
+        if not op.isdir(directory):
+            os.makedirs(directory, 0o755)
+
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        if hasattr(os, 'O_BINARY'):
+            flags |= os.O_BINARY
+        try:
+            fd = os.open(path, flags, 0o600)
+        except FileExistsError:
+            with open(path, 'rb') as reader:
+                data = reader.read()
+            if len(data) < PICKLE_KEY_MIN_LEN:
+                raise RuntimeError(
+                    'DiskCache pickle key file %r is too short (%d < %d); '
+                    'remove it to regenerate, or supply pickle_key='
+                    'explicitly.'
+                    % (path, len(data), PICKLE_KEY_MIN_LEN)
+                )
+            return data
+        else:
+            try:
+                new_key = secrets.token_bytes(32)
+                os.write(fd, new_key)
+            finally:
+                os.close(fd)
+            with cl.suppress(OSError):
+                os.chmod(path, 0o600)
+            return new_key
+
+    def _pickle_dump(self, obj, optimize=False):
+        """Pickle ``obj`` and wrap with HMAC envelope (or raw bytes if
+        HMAC has been disabled via ``pickle_key=False``).
+        """
+        payload = pickle.dumps(obj, protocol=self.pickle_protocol)
+        if optimize:
+            payload = pickletools.optimize(payload)
+        key = self._resolve_pickle_key()
+        if key is False:
+            return payload
+        mac = hmac.new(key, payload, hashlib.sha256).digest()
+        return PICKLE_MAGIC + mac + payload
+
+    def _pickle_load_bytes(self, data):
+        """Verify the HMAC envelope and unpickle ``data``."""
+        if isinstance(data, sqlite3.Binary):
+            data = bytes(data)
+        elif isinstance(data, memoryview):
+            data = data.tobytes()
+        elif not isinstance(data, (bytes, bytearray)):
+            data = bytes(data)
+
+        magic_len = len(PICKLE_MAGIC)
+        has_envelope = (
+            len(data) >= PICKLE_HEADER_SIZE
+            and data[:magic_len] == PICKLE_MAGIC
+        )
+        key = self._resolve_pickle_key()
+
+        if has_envelope:
+            mac = data[magic_len:PICKLE_HEADER_SIZE]
+            payload = data[PICKLE_HEADER_SIZE:]
+            if key is False:
+                # Legacy mode: skip verification, but still strip the
+                # envelope so we unpickle the same bytes the writer
+                # intended.
+                return pickle.load(io.BytesIO(payload))
+            expected = hmac.new(key, payload, hashlib.sha256).digest()
+            if not hmac.compare_digest(mac, expected):
+                raise pickle.UnpicklingError(
+                    'diskcache: pickle HMAC verification failed; cache '
+                    'entry may be corrupt or tampered with '
+                    '(CVE-2025-69872).'
+                )
+            return pickle.load(io.BytesIO(payload))
+
+        # No envelope present.
+        if key is False:
+            return pickle.load(io.BytesIO(data))
+        raise pickle.UnpicklingError(
+            'diskcache: pickle envelope missing; this cache entry '
+            'predates the CVE-2025-69872 mitigation. Pass '
+            'pickle_key=False to read legacy data (insecure), or '
+            'recreate the cache.'
+        )
+
+    def _pickle_load_file(self, fileobj):
+        """Read entire file and verify before unpickling.
+
+        Note: large MODE_PICKLE values stored as separate ``.val`` files
+        are buffered in memory so the bytes verified by HMAC are exactly
+        the bytes fed to ``pickle.load`` (no TOCTOU window).
+        """
+        return self._pickle_load_bytes(fileobj.read())
+
+    # -- end CVE mitigation helpers ---------------------------------------
 
     def hash(self, key):
         """Compute portable hash for `key`.
@@ -158,9 +420,8 @@ class Disk:
         ):
             return key, True
         else:
-            data = pickle.dumps(key, protocol=self.pickle_protocol)
-            result = pickletools.optimize(data)
-            return sqlite3.Binary(result), False
+            data = self._pickle_dump(key, optimize=True)
+            return sqlite3.Binary(data), False
 
     def get(self, key, raw):
         """Convert fields `key` and `raw` from Cache table to key.
@@ -174,7 +435,7 @@ class Disk:
         if raw:
             return bytes(key) if type(key) is sqlite3.Binary else key
         else:
-            return pickle.load(io.BytesIO(key))
+            return self._pickle_load_bytes(key)
 
     def store(self, value, read, key=UNKNOWN):
         """Convert `value` to fields size, mode, filename, and value for Cache
@@ -218,7 +479,7 @@ class Disk:
             size = self._write(full_path, iterator, 'xb')
             return size, MODE_BINARY, filename, None
         else:
-            result = pickle.dumps(value, protocol=self.pickle_protocol)
+            result = self._pickle_dump(value)
 
             if len(result) < min_file_size:
                 return 0, MODE_PICKLE, None, sqlite3.Binary(result)
@@ -279,9 +540,9 @@ class Disk:
         elif mode == MODE_PICKLE:
             if value is None:
                 with open(op.join(self._directory, filename), 'rb') as reader:
-                    return pickle.load(reader)
+                    return self._pickle_load_file(reader)
             else:
-                return pickle.load(io.BytesIO(value))
+                return self._pickle_load_bytes(value)
 
     def filename(self, key=UNKNOWN, value=UNKNOWN):
         """Return filename and full-path tuple for file storage.
@@ -423,13 +684,24 @@ class Cache:
         :param str directory: cache directory
         :param float timeout: SQLite connection timeout
         :param disk: Disk type or subclass for serialization
-        :param settings: any of DEFAULT_SETTINGS
+        :param settings: any of DEFAULT_SETTINGS, plus the optional
+            non-persistent ``disk_pickle_key`` argument used to verify
+            pickle envelopes (CVE-2025-69872).  See :class:`Disk` for the
+            accepted values.
 
         """
         try:
             assert issubclass(disk, Disk)
         except (TypeError, AssertionError):
             raise ValueError('disk must subclass diskcache.Disk') from None
+
+        # CVE-2025-69872: ``disk_pickle_key`` is intentionally treated as
+        # constructor-only configuration.  Persisting it in the Settings
+        # table would either leak the secret into the same compromised
+        # cache directory or let an attacker make ``pickle_key=False``
+        # sticky across restarts via ``cache.reset``.  Pop it before any
+        # of the regular settings plumbing runs.
+        pickle_key = settings.pop('disk_pickle_key', _PICKLE_KEY_UNSET)
 
         if directory is None:
             directory = tempfile.mkdtemp(prefix='diskcache-')
@@ -490,6 +762,13 @@ class Cache:
             for key, value in sets.items()
             if key.startswith('disk_')
         }
+        # Defensive: never source pickle_key from persisted Settings even
+        # if a stale row exists (it should not, because we never store
+        # it -- but Settings tables created by older patched builds or
+        # by hand could in principle contain one).
+        kwargs.pop('pickle_key', None)
+        if pickle_key is not _PICKLE_KEY_UNSET:
+            kwargs['pickle_key'] = pickle_key
         self._disk = disk(directory, **kwargs)
 
         # Set cached attributes: updates settings and sets pragmas.
@@ -1968,6 +2247,12 @@ class Cache:
 
                     for full_path in error:
                         if DBNAME in full_path:
+                            continue
+
+                        if op.basename(full_path) == PICKLE_KEY_FILENAME:
+                            # CVE-2025-69872: auto-generated HMAC key
+                            # file lives at the root of the cache dir
+                            # and is not tracked in the Cache table.
                             continue
 
                         message = 'unknown file: %s' % full_path

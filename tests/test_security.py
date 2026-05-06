@@ -894,3 +894,363 @@ def test_typeerror_message_lists_only_real_types(tmp_cache_dir, clear_env):
         'TypeError must not advertise False/None: caller filters them. '
         'Got: %r' % msg
     )
+
+
+# -- Pass-3 round of fixes ---------------------------------------------
+
+
+def test_v3_keyboard_interrupt_during_write_cleans_up(
+    tmp_cache_dir, clear_env, monkeypatch
+):
+    """V3: BaseException (KeyboardInterrupt / SystemExit) during the
+    key-file write must not leave an empty file behind that
+    permanently blocks every subsequent process."""
+    from diskcache import core as dc_core
+
+    keyfile = op.join(tmp_cache_dir, PICKLE_KEY_FILENAME)
+    orig_write = os.write
+
+    def kbd_int_write(fd, data):  # pragma: no cover - exercised below
+        raise KeyboardInterrupt('simulated Ctrl+C')
+
+    monkeypatch.setattr(os, 'write', kbd_int_write)
+    with pytest.raises(KeyboardInterrupt):
+        dc_core._read_or_create_pickle_key_file(keyfile)
+    monkeypatch.setattr(os, 'write', orig_write)
+
+    assert not op.exists(keyfile), (
+        'Empty key file must be unlinked after KeyboardInterrupt; '
+        'leaving it behind permanently blocks other processes with '
+        'a "too short" RuntimeError.'
+    )
+
+    # And a fresh attempt now succeeds without manual cleanup:
+    key, created = dc_core._read_or_create_pickle_key_file(keyfile)
+    assert created and len(key) >= 16
+
+
+def test_v3_oserror_during_write_cleans_up(
+    tmp_cache_dir, clear_env, monkeypatch
+):
+    """V3: A regular OSError (disk full) during write must also remove
+    the half-baked file."""
+    from diskcache import core as dc_core
+
+    keyfile = op.join(tmp_cache_dir, PICKLE_KEY_FILENAME)
+
+    def disk_full_write(fd, data):
+        raise OSError(28, 'No space left on device')
+
+    monkeypatch.setattr(os, 'write', disk_full_write)
+    with pytest.raises(OSError):
+        dc_core._read_or_create_pickle_key_file(keyfile)
+    assert not op.exists(keyfile)
+
+
+def test_v9_unc_or_invalid_filename_raises_valueerror(
+    tmp_cache_dir, clear_env
+):
+    """V9: ``_safe_filename_path`` must translate platform OSError
+    (e.g. Windows UNC path resolution failure) into the documented
+    ValueError so callers don't have to also catch OSError."""
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.Cache(tmp_cache_dir) as cache:
+            disk = cache._disk
+    if sys.platform == 'win32':
+        with pytest.raises(ValueError):
+            disk._safe_filename_path(
+                '//nonexistent-server-xyz9876/share/file.txt'
+            )
+    else:
+        # On POSIX, realpath of an absolute path that escapes the dir
+        # also surfaces as ValueError (containment check rather than
+        # OSError, but same exception class as documented).
+        with pytest.raises(ValueError):
+            disk._safe_filename_path('/etc/passwd')
+
+
+def test_v6_realpath_cached_after_first_call(tmp_cache_dir, clear_env):
+    """V6: After the first call, ``_directory_realpath`` is populated
+    so subsequent fetches do not re-resolve the cache directory."""
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.Cache(
+            tmp_cache_dir,
+            disk_pickle_key=secrets.token_bytes(32),
+            disk_min_file_size=1,
+        ) as cache:
+            assert cache._disk._directory_realpath is None
+            cache['k'] = b'x' * 64        # forces a .val file
+            _ = cache['k']                 # triggers _safe_filename_path
+            cached = cache._disk._directory_realpath
+            assert cached is not None
+            assert cached == op.realpath(tmp_cache_dir)
+
+
+def test_v13_filename_none_with_file_mode_raises_valueerror(
+    tmp_cache_dir, clear_env
+):
+    """V13: a tampered row with mode=BINARY/TEXT/PICKLE and
+    filename=NULL must raise a clear ValueError -- not the previous
+    ``UnboundLocalError: local variable 'full_path' referenced before
+    assignment``."""
+    key = secrets.token_bytes(32)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.Cache(tmp_cache_dir, disk_pickle_key=key) as cache:
+            cache['k'] = b'x' * 16
+
+    con = sqlite3.connect(op.join(tmp_cache_dir, 'cache.db'))
+    try:
+        con.execute(
+            'UPDATE Cache SET filename = NULL, mode = 2, value = NULL '
+            'WHERE key = ?', ('k',)
+        )
+        con.commit()
+    finally:
+        con.close()
+
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.Cache(tmp_cache_dir, disk_pickle_key=key) as cache:
+            with pytest.raises(ValueError, match='mode'):
+                cache['k']
+
+
+def test_v5_jsondisk_fanout_no_keyfile_no_warning(
+    tmp_cache_dir, clear_env
+):
+    """V5: ``FanoutCache(disk=JSONDisk)`` must NOT auto-generate the
+    pickle HMAC key file or emit ``UnsafePickleWarning``, since
+    JSONDisk never exercises the pickle path."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        with dc.FanoutCache(
+            tmp_cache_dir, shards=4, disk=dc.JSONDisk
+        ) as cache:
+            cache[('a', 'b')] = {'v': 1}
+            assert cache[('a', 'b')] == {'v': 1}
+
+    pkey_warnings = [
+        w for w in caught if isinstance(w.message, dc.UnsafePickleWarning)
+    ]
+    assert pkey_warnings == [], (
+        'JSONDisk under FanoutCache must not emit UnsafePickleWarning, '
+        'got: %r' % [str(w.message) for w in pkey_warnings]
+    )
+    assert not op.exists(op.join(tmp_cache_dir, PICKLE_KEY_FILENAME)), (
+        'JSONDisk under FanoutCache must not auto-generate the pickle '
+        'HMAC key file at the root.'
+    )
+    for num in range(4):
+        shard_keyfile = op.join(
+            tmp_cache_dir, '%03d' % num, PICKLE_KEY_FILENAME
+        )
+        assert not op.exists(shard_keyfile)
+
+
+def test_v5_disk_uses_pickle_class_attr():
+    """V5: the ``_uses_pickle`` capability flag is True for the base
+    ``Disk`` and False for ``JSONDisk``."""
+    assert dc.Disk._uses_pickle is True
+    assert dc.JSONDisk._uses_pickle is False
+
+
+def test_v1_fanoutcache_pickling_with_explicit_key_raises(
+    tmp_cache_dir, clear_env
+):
+    """V1: FanoutCache.__getstate__ must mirror Cache.__getstate__'s
+    refusal when an explicit pickle key was provided (else pickling
+    silently strips the secret and corrupts reads in the receiving
+    process)."""
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        fc = dc.FanoutCache(
+            tmp_cache_dir,
+            shards=2,
+            disk_pickle_key=secrets.token_bytes(32),
+        )
+        try:
+            with pytest.raises(TypeError, match='disk_pickle_key'):
+                pickle.dumps(fc)
+        finally:
+            fc.close()
+
+
+def test_v1_fanoutcache_pickling_with_legacy_mode_raises(
+    tmp_cache_dir, clear_env
+):
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        fc = dc.FanoutCache(
+            tmp_cache_dir, shards=2, disk_pickle_key=False
+        )
+        try:
+            with pytest.raises(TypeError, match='disk_pickle_key'):
+                pickle.dumps(fc)
+        finally:
+            fc.close()
+
+
+def test_v1_fanoutcache_pickling_with_default_succeeds(
+    tmp_cache_dir, clear_env
+):
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.FanoutCache(tmp_cache_dir, shards=2) as fc:
+            fc['k'] = {'v': 1}
+            blob = pickle.dumps(fc)
+            other = pickle.loads(blob)
+            try:
+                assert other['k'] == {'v': 1}
+            finally:
+                other.close()
+
+
+def test_v2_deque_pickling_with_explicit_key_raises(
+    tmp_cache_dir, clear_env
+):
+    """V2: Deque (built on Cache) must inherit the H2 protection."""
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        cache = dc.Cache(tmp_cache_dir, disk_pickle_key=secrets.token_bytes(32))
+        try:
+            deque = dc.Deque.fromcache(cache, [{'item': 1}])
+            with pytest.raises(TypeError, match='disk_pickle_key'):
+                pickle.dumps(deque)
+        finally:
+            cache.close()
+
+
+def test_v2_index_pickling_with_explicit_key_raises(
+    tmp_cache_dir, clear_env
+):
+    """V2: Index (built on Cache) must inherit the H2 protection."""
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        cache = dc.Cache(tmp_cache_dir, disk_pickle_key=secrets.token_bytes(32))
+        try:
+            idx = dc.Index.fromcache(cache, {'k': 'v'})
+            with pytest.raises(TypeError, match='disk_pickle_key'):
+                pickle.dumps(idx)
+        finally:
+            cache.close()
+
+
+def test_v2_deque_pickling_with_default_succeeds(tmp_cache_dir, clear_env):
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        cache = dc.Cache(tmp_cache_dir)
+        try:
+            deque = dc.Deque.fromcache(cache, [{'item': 1}])
+            blob = pickle.dumps(deque)
+            other = pickle.loads(blob)
+            assert list(other) == [{'item': 1}]
+        finally:
+            cache.close()
+
+
+def test_v11_copy_copy_preserves_explicit_key(tmp_cache_dir, clear_env):
+    """V11: ``copy.copy(cache)`` does not cross a process boundary, so
+    the explicit pickle_key should be preserved (not rejected by
+    __getstate__) and a working independent Cache returned."""
+    import copy
+
+    secret = secrets.token_bytes(32)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.Cache(tmp_cache_dir, disk_pickle_key=secret) as cache:
+            cache['k'] = {'v': 1}
+            shallow = copy.copy(cache)
+            try:
+                assert shallow.directory == cache.directory
+                assert shallow._disk._pickle_key_arg == secret
+                assert shallow['k'] == {'v': 1}
+            finally:
+                shallow.close()
+
+
+def test_v11_copy_deepcopy_preserves_explicit_key(tmp_cache_dir, clear_env):
+    import copy
+
+    secret = secrets.token_bytes(32)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.Cache(tmp_cache_dir, disk_pickle_key=secret) as cache:
+            cache['k'] = {'v': 1}
+            deep = copy.deepcopy(cache)
+            try:
+                assert deep['k'] == {'v': 1}
+            finally:
+                deep.close()
+
+
+def test_v11_copy_copy_with_default_still_works(tmp_cache_dir, clear_env):
+    import copy
+
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.Cache(tmp_cache_dir) as cache:
+            cache['k'] = {'v': 1}
+            shallow = copy.copy(cache)
+            try:
+                assert shallow['k'] == {'v': 1}
+            finally:
+                shallow.close()
+
+
+def test_v10_warning_mentions_bootstrap_race(tmp_cache_dir, clear_env):
+    """V10: the auto-generated-key warning must explicitly mention the
+    bootstrap-race risk so operators understand the threat model
+    (otherwise they may assume the file-mode 0o600 key is safe in any
+    multi-tenant directory)."""
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter('always')
+        with dc.Cache(tmp_cache_dir) as cache:
+            cache[('complex',)] = {'value': 1}
+
+    msgs = [
+        w for w in caught if isinstance(w.message, dc.UnsafePickleWarning)
+    ]
+    assert msgs
+    assert 'bootstrap race' in str(msgs[0].message).lower(), (
+        'Warning should mention bootstrap race; got: %r'
+        % str(msgs[0].message)
+    )
+
+
+def test_v12_short_key_file_raises_clear_runtimeerror(
+    tmp_cache_dir, clear_env
+):
+    """V12: coverage for the "after N retries" RuntimeError path in
+    ``_read_or_create_pickle_key_file``."""
+    from diskcache import core as dc_core
+
+    keyfile = op.join(tmp_cache_dir, PICKLE_KEY_FILENAME)
+    with open(keyfile, 'wb') as fh:
+        fh.write(b'short')
+    with pytest.raises(RuntimeError, match='too short.*after'):
+        dc_core._read_or_create_pickle_key_file(keyfile)
+
+
+def test_v12_safe_filename_path_rejects_non_string(
+    tmp_cache_dir, clear_env
+):
+    """V12: coverage for the type guard in ``_safe_filename_path``."""
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.Cache(tmp_cache_dir) as cache:
+            with pytest.raises(ValueError, match='must be str'):
+                cache._disk._safe_filename_path(123)
+
+
+def test_v12_bytearray_pickle_key_accepted(tmp_cache_dir, clear_env):
+    """V12: bytearray is accepted by _coerce_pickle_key but was never
+    exercised before."""
+    key = bytearray(secrets.token_bytes(32))
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.Cache(tmp_cache_dir, disk_pickle_key=key) as cache:
+            cache['k'] = {'v': 1}
+            assert cache['k'] == {'v': 1}

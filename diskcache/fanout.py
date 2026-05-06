@@ -60,30 +60,49 @@ class FanoutCache:
         # (FanoutCache._hash uses shard 0's key but storage may land in
         # shard N which holds a different key) and emitting one
         # warning per shard.
+        # CVE-2025-69872 (V5): skip eager key resolution for Disk
+        # subclasses that never use pickle (e.g. JSONDisk).  Without
+        # this we would auto-generate ``.diskcache_pickle_key`` and
+        # emit an UnsafePickleWarning even though the cache will never
+        # exercise the pickle path.
         pickle_key_arg = settings.pop('disk_pickle_key', _PICKLE_KEY_UNSET)
-        if not op.isdir(directory):
-            os.makedirs(directory, 0o755, exist_ok=True)
-        resolved_key, source = _resolve_pickle_key_for_directory(
-            directory, pickle_key_arg
-        )
-        _emit_pickle_key_warning(source, directory, stacklevel=3)
+        # V1: remember the user's original argument so __getstate__
+        # only refuses pickling when the user explicitly provided a
+        # secret.  Auto-generated / env-var keys can be re-resolved in
+        # the receiving process, so default-mode FanoutCache pickling
+        # remains supported.
+        self._pickle_key_user_arg = pickle_key_arg
+        if getattr(disk, '_uses_pickle', True):
+            if not op.isdir(directory):
+                os.makedirs(directory, 0o755, exist_ok=True)
+            resolved_key, source = _resolve_pickle_key_for_directory(
+                directory, pickle_key_arg
+            )
+            _emit_pickle_key_warning(source, directory, stacklevel=3)
+        else:
+            # Forward the user's explicit choice unchanged so that any
+            # custom Disk subclass that mixes pickle + non-pickle paths
+            # still honours an explicit key.  No file/env resolution.
+            resolved_key = pickle_key_arg
 
         self._count = shards
         self._directory = directory
         self._disk = disk
+        shard_kwargs = dict(settings)
+        if resolved_key is not _PICKLE_KEY_UNSET:
+            shard_kwargs['disk_pickle_key'] = resolved_key
         self._shards = tuple(
             Cache(
                 directory=op.join(directory, '%03d' % num),
                 timeout=timeout,
                 disk=disk,
                 size_limit=size_limit,
-                disk_pickle_key=resolved_key,
-                **settings,
+                **shard_kwargs,
             )
             for num in range(shards)
         )
         # Suppress per-shard warnings: the FanoutCache already emitted
-        # one above for the entire ensemble.
+        # one above for the entire ensemble (when applicable).
         for shard in self._shards:
             shard._disk._pickle_key_warned = True
         self._hash = self._shards[0].disk.hash
@@ -563,6 +582,22 @@ class FanoutCache:
         self.close()
 
     def __getstate__(self):
+        # CVE-2025-69872 (V1): mirror :meth:`Cache.__getstate__`'s
+        # protection.  Only refuse when the *user* supplied an
+        # explicit secret (or False) -- auto-generated / env-var keys
+        # are re-resolved by the receiving process, so default-mode
+        # pickling still works.
+        arg = self._pickle_key_user_arg
+        if arg is not _PICKLE_KEY_UNSET and arg is not None:
+            raise TypeError(
+                'diskcache: FanoutCache instances configured with an '
+                'explicit disk_pickle_key (or disk_pickle_key=False) '
+                'cannot be pickled because the secret is not placed '
+                'in pickle state. Pickle the cache directory path '
+                'instead and reconstruct FanoutCache(directory, '
+                'disk_pickle_key=...) in the receiving process. '
+                '(CVE-2025-69872)'
+            )
         return (self._directory, self._count, self.timeout, type(self.disk))
 
     def __setstate__(self, state):

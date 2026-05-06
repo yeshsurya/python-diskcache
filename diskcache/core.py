@@ -182,23 +182,23 @@ def _read_or_create_pickle_key_file(path):
                 % (path, last_short_len, PICKLE_KEY_MIN_LEN, attempt + 1)
             )
 
-        # We won the race.  Generate and write the key.
+        # We won the race.  Generate and write the key.  Use try/finally
+        # so we clean up the half-baked file even on KeyboardInterrupt /
+        # SystemExit (otherwise an empty file blocks every subsequent
+        # process with a "too short" RuntimeError until manually removed).
+        write_succeeded = False
         try:
             new_key = secrets.token_bytes(32)
             os.write(fd, new_key)
             with cl.suppress(OSError):
                 os.fsync(fd)
-        except OSError:
-            # Disk full / write failure.  Remove the half-baked file so
-            # subsequent processes don't get stuck on a permanent
-            # too-short error.
+            write_succeeded = True
+        finally:
             with cl.suppress(OSError):
                 os.close(fd)
-            with cl.suppress(OSError):
-                os.unlink(path)
-            raise
-        else:
-            os.close(fd)
+            if not write_succeeded:
+                with cl.suppress(OSError):
+                    os.unlink(path)
 
         with cl.suppress(OSError):
             os.chmod(path, 0o600)
@@ -265,10 +265,12 @@ def _emit_pickle_key_warning(source, directory, stacklevel):
             'diskcache: using pickle HMAC key from %r (CVE-2025-69872 '
             'default fallback). This detects accidental cache '
             'corruption but does NOT protect against attackers with '
-            'read access to the cache directory. For stronger '
-            'protection set the %s environment variable to a hex-'
-            'encoded random key (>= %d bytes), or pass pickle_key=... '
-            'explicitly.'
+            'read access to the cache directory, nor against a '
+            '"bootstrap race" where an attacker writes the cache '
+            'directory before the legitimate process initializes (and '
+            'thereby controls the key). For production use set the %s '
+            'environment variable to a hex-encoded random key '
+            '(>= %d bytes), or pass pickle_key=... explicitly.'
             % (key_path, PICKLE_KEY_ENV, PICKLE_KEY_MIN_LEN),
             UnsafePickleWarning,
             stacklevel=stacklevel,
@@ -340,6 +342,14 @@ EVICTION_POLICY = {
 class Disk:
     """Cache key and value serialization for SQLite database and files."""
 
+    #: Whether this Disk class uses pickle for serialization.  When
+    #: ``False``, callers like :class:`diskcache.FanoutCache` can skip
+    #: eager HMAC key resolution (CVE-2025-69872) and avoid creating an
+    #: unused ``.diskcache_pickle_key`` file at the cache root.  Custom
+    #: subclasses that bypass the pickle paths (like :class:`JSONDisk`)
+    #: should set this to ``False``.
+    _uses_pickle = True
+
     def __init__(self, directory, min_file_size=0, pickle_protocol=0,
                  pickle_key=_PICKLE_KEY_UNSET):
         """Initialize disk instance.
@@ -363,6 +373,12 @@ class Disk:
         self._directory = directory
         self.min_file_size = min_file_size
         self.pickle_protocol = pickle_protocol
+        # CVE-2025-69872: pre-compute realpath of the cache directory so
+        # path-traversal validation in :meth:`_safe_filename_path` only
+        # makes one ``realpath`` syscall per fetch instead of two.  The
+        # value is computed lazily on first use to support construction
+        # with a not-yet-existing directory.
+        self._directory_realpath = None
         # Eagerly validate explicit (non-False, non-None) keys so bad
         # input fails at construction time instead of on first use.
         # ``False`` and ``None`` stay lazy so we don't emit warnings or
@@ -614,15 +630,37 @@ class Disk:
         refuses any ``filename`` whose resolved location is not
         strictly inside ``self._directory``.
 
-        :raises ValueError: if ``filename`` escapes the cache directory.
+        :raises ValueError: if ``filename`` is not a string, escapes
+            the cache directory, or resolves to a path that cannot be
+            interpreted (e.g. an unreachable Windows UNC path).
         """
         if not isinstance(filename, str):
             raise ValueError(
                 'diskcache: cache filename must be str, got %s'
                 % type(filename).__name__
             )
-        base = op.realpath(self._directory)
-        full = op.realpath(op.join(self._directory, filename))
+        # Cache realpath of the directory once (CVE-2025-69872 perf).
+        base = self._directory_realpath
+        if base is None:
+            try:
+                base = op.realpath(self._directory)
+            except OSError as exc:
+                raise ValueError(
+                    'diskcache: cannot resolve cache directory %r (%s)'
+                    % (self._directory, exc)
+                ) from exc
+            self._directory_realpath = base
+        try:
+            full = op.realpath(op.join(self._directory, filename))
+        except OSError as exc:
+            # CVE-2025-69872: translate platform-specific resolution
+            # failures (e.g. Windows UNC ``\\server\\share`` raising
+            # FileNotFoundError) into the documented ValueError so
+            # callers do not have to catch OSError separately.
+            raise ValueError(
+                'diskcache: cannot resolve cache filename %r (%s; '
+                'cache.db may be tampered)' % (filename, exc)
+            ) from exc
         if full != base and not full.startswith(base + os.sep):
             raise ValueError(
                 'diskcache: cache filename %r escapes cache directory '
@@ -646,8 +684,23 @@ class Disk:
         # pylint: disable=unidiomatic-typecheck,consider-using-with
         if mode == MODE_RAW:
             return bytes(value) if type(value) is sqlite3.Binary else value
-        if filename is not None:
+
+        # CVE-2025-69872 (V13): file-backed modes require a filename.
+        # If the row was tampered (mode=BINARY/TEXT/PICKLE but
+        # filename=NULL), raise a clear error rather than the previous
+        # UnboundLocalError.
+        if filename is None:
+            if mode in (MODE_BINARY, MODE_TEXT) or (
+                mode == MODE_PICKLE and value is None
+            ):
+                raise ValueError(
+                    'diskcache: cache row has mode=%d but filename is None '
+                    '(cache.db may be tampered).' % mode
+                )
+            full_path = None
+        else:
             full_path = self._safe_filename_path(filename)
+
         if mode == MODE_BINARY:
             if read:
                 return open(full_path, 'rb')
@@ -727,6 +780,14 @@ class Disk:
 
 class JSONDisk(Disk):
     """Cache key and value using JSON serialization with zlib compression."""
+
+    # CVE-2025-69872: JSONDisk routes every key/value through JSON+zlib
+    # bytes, which hit the early-return MODE_RAW / MODE_BINARY branches
+    # of the base Disk and never reach the pickle paths.  Declaring
+    # ``_uses_pickle = False`` prevents :class:`FanoutCache` from
+    # eagerly resolving (and possibly auto-generating) an HMAC key file
+    # that JSONDisk would never use.
+    _uses_pickle = False
 
     def __init__(self, directory, compress_level=1, **kwargs):
         """Initialize JSON disk instance.
@@ -2817,6 +2878,31 @@ class Cache:
 
     def __setstate__(self, state):
         self.__init__(*state)
+
+    def __copy__(self):
+        # CVE-2025-69872 (V11): in-process ``copy.copy`` does not cross a
+        # trust boundary -- preserve the explicit pickle_key (if any) so
+        # users who legitimately copy a Cache aren't tripped up by the
+        # __getstate__ guard above.
+        return self._copy_for_same_process()
+
+    def __deepcopy__(self, memo):
+        return self._copy_for_same_process()
+
+    def _copy_for_same_process(self):
+        disk = self._disk
+        arg = getattr(disk, '_pickle_key_arg', _PICKLE_KEY_UNSET)
+        kwargs = {}
+        if arg is not _PICKLE_KEY_UNSET:
+            # Forward bytes / False explicitly so the new instance has
+            # the same security posture as the original.
+            kwargs['disk_pickle_key'] = arg
+        return self.__class__(
+            self.directory,
+            timeout=self.timeout,
+            disk=type(self.disk),
+            **kwargs,
+        )
 
     def reset(self, key, value=ENOVAL, update=True):
         """Reset `key` and `value` item from Settings table.

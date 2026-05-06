@@ -91,6 +91,191 @@ class UnsafePickleWarning(UserWarning):
     See CVE-2025-69872 / GHSA-w8v5-vhqr-4h9v.
     """
 
+
+# Sources reported by :func:`_resolve_pickle_key_for_directory`.
+_PKEY_SRC_DISABLED = 'disabled'
+_PKEY_SRC_EXPLICIT = 'explicit'
+_PKEY_SRC_ENV = 'env'
+_PKEY_SRC_FILE_CREATED = 'file_created'
+_PKEY_SRC_FILE_EXISTING = 'file_existing'
+
+
+def _coerce_pickle_key(value, source):
+    """Validate and coerce a user-supplied HMAC key value to ``bytes``.
+
+    ``value`` must be ``bytes``/``bytearray`` or a hex-encoded ``str``.
+    ``False`` and ``None`` are filtered by callers and never reach this
+    function.
+    """
+    if isinstance(value, str):
+        try:
+            key = bytes.fromhex(value)
+        except ValueError:
+            raise ValueError(
+                '%s must be hex-encoded bytes' % source
+            ) from None
+    elif isinstance(value, (bytes, bytearray)):
+        key = bytes(value)
+    else:
+        raise TypeError(
+            '%s must be bytes, bytearray, or hex str; got %s'
+            % (source, type(value).__name__)
+        )
+    if len(key) < PICKLE_KEY_MIN_LEN:
+        raise ValueError(
+            '%s must be at least %d bytes (got %d)'
+            % (source, PICKLE_KEY_MIN_LEN, len(key))
+        )
+    return key
+
+
+def _read_or_create_pickle_key_file(path):
+    """Atomically create or read the on-disk HMAC key file at ``path``.
+
+    Returns ``(key_bytes, created)``.  ``created`` is ``True`` when the
+    current process emerged as the writer in a multi-process race.
+
+    Uses ``O_CREAT | O_EXCL`` so the first writer wins; concurrent
+    losers retry the read with a short backoff to ride out the race
+    window between the winner's ``os.open`` and ``os.write`` -- the
+    pre-fix code raised a false-positive "too short" error on every
+    loser and required manual recovery.
+    """
+    directory = op.dirname(path) or '.'
+    os.makedirs(directory, 0o755, exist_ok=True)
+
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, 'O_BINARY'):
+        flags |= os.O_BINARY
+
+    delay = 0.001
+    last_short_len = -1
+    for attempt in range(6):
+        try:
+            fd = os.open(path, flags, 0o600)
+        except FileExistsError:
+            try:
+                with open(path, 'rb') as reader:
+                    data = reader.read()
+            except (FileNotFoundError, PermissionError):
+                # File vanished or was momentarily inaccessible.  Try
+                # to (re)create on the next iteration.
+                time.sleep(delay)
+                delay *= 2
+                continue
+
+            if len(data) >= PICKLE_KEY_MIN_LEN:
+                return data, False
+
+            # Race window: the winning writer hasn't completed its
+            # ``os.write`` yet (or it crashed mid-write).  Retry.
+            last_short_len = len(data)
+            if attempt < 5:
+                time.sleep(delay)
+                delay *= 2
+                continue
+
+            raise RuntimeError(
+                'diskcache: pickle key file %r is too short (%d < %d) '
+                'after %d retries; it may be corrupted -- remove it to '
+                'regenerate, or pass pickle_key= explicitly.'
+                % (path, last_short_len, PICKLE_KEY_MIN_LEN, attempt + 1)
+            )
+
+        # We won the race.  Generate and write the key.
+        try:
+            new_key = secrets.token_bytes(32)
+            os.write(fd, new_key)
+            with cl.suppress(OSError):
+                os.fsync(fd)
+        except OSError:
+            # Disk full / write failure.  Remove the half-baked file so
+            # subsequent processes don't get stuck on a permanent
+            # too-short error.
+            with cl.suppress(OSError):
+                os.close(fd)
+            with cl.suppress(OSError):
+                os.unlink(path)
+            raise
+        else:
+            os.close(fd)
+
+        with cl.suppress(OSError):
+            os.chmod(path, 0o600)
+        return new_key, True
+
+    # Defensive: the loop should always return or raise.
+    raise RuntimeError(
+        'diskcache: failed to create pickle key file %r' % path
+    )
+
+
+def _resolve_pickle_key_for_directory(directory, arg):
+    """Resolve the pickle HMAC key for ``directory``.
+
+    Returns ``(key, source)`` where ``key`` is ``bytes`` or ``False``
+    and ``source`` is one of the ``_PKEY_SRC_*`` constants.  This is
+    the single source of truth shared by :class:`Disk` and
+    :class:`~diskcache.FanoutCache` so a fanout cache's shards all use
+    the same key (otherwise sharding becomes non-deterministic).
+    """
+    if arg is False:
+        return False, _PKEY_SRC_DISABLED
+
+    if arg is not _PICKLE_KEY_UNSET and arg is not None:
+        return (
+            _coerce_pickle_key(arg, source='pickle_key argument'),
+            _PKEY_SRC_EXPLICIT,
+        )
+
+    env_value = os.environ.get(PICKLE_KEY_ENV)
+    if env_value:
+        return (
+            _coerce_pickle_key(
+                env_value,
+                source='%s environment variable' % PICKLE_KEY_ENV,
+            ),
+            _PKEY_SRC_ENV,
+        )
+
+    key_path = op.join(directory, PICKLE_KEY_FILENAME)
+    key, created = _read_or_create_pickle_key_file(key_path)
+    return key, _PKEY_SRC_FILE_CREATED if created else _PKEY_SRC_FILE_EXISTING
+
+
+def _emit_pickle_key_warning(source, directory, stacklevel):
+    """Emit the appropriate :class:`UnsafePickleWarning` for ``source``.
+
+    Returns ``True`` if a warning was emitted, ``False`` otherwise (so
+    the caller can flip its "already warned" flag accurately).
+    """
+    if source == _PKEY_SRC_DISABLED:
+        warnings.warn(
+            'diskcache: pickle HMAC verification is disabled '
+            '(pickle_key=False). The cache directory must be fully '
+            'trusted; an attacker with write access can achieve '
+            'arbitrary code execution via CVE-2025-69872.',
+            UnsafePickleWarning,
+            stacklevel=stacklevel,
+        )
+        return True
+    if source in (_PKEY_SRC_FILE_CREATED, _PKEY_SRC_FILE_EXISTING):
+        key_path = op.join(directory, PICKLE_KEY_FILENAME)
+        warnings.warn(
+            'diskcache: using pickle HMAC key from %r (CVE-2025-69872 '
+            'default fallback). This detects accidental cache '
+            'corruption but does NOT protect against attackers with '
+            'read access to the cache directory. For stronger '
+            'protection set the %s environment variable to a hex-'
+            'encoded random key (>= %d bytes), or pass pickle_key=... '
+            'explicitly.'
+            % (key_path, PICKLE_KEY_ENV, PICKLE_KEY_MIN_LEN),
+            UnsafePickleWarning,
+            stacklevel=stacklevel,
+        )
+        return True
+    return False
+
 MODE_NONE = 0
 MODE_RAW = 1
 MODE_BINARY = 2
@@ -187,7 +372,7 @@ class Disk:
             and pickle_key is not None
             and pickle_key is not False
         ):
-            pickle_key = self._coerce_pickle_key(
+            pickle_key = _coerce_pickle_key(
                 pickle_key, source='pickle_key argument'
             )
         self._pickle_key_arg = pickle_key
@@ -205,110 +390,15 @@ class Disk:
         if self._pickle_key_resolved is not None:
             return self._pickle_key_resolved
 
-        arg = self._pickle_key_arg
-
-        if arg is False:
-            if not self._pickle_key_warned:
-                warnings.warn(
-                    'DiskCache pickle HMAC verification is disabled '
-                    '(pickle_key=False). The cache directory must be '
-                    'fully trusted; an attacker with write access can '
-                    'achieve arbitrary code execution via '
-                    'CVE-2025-69872.',
-                    UnsafePickleWarning,
-                    stacklevel=4,
-                )
-                self._pickle_key_warned = True
-            self._pickle_key_resolved = False
-            return False
-
-        if arg is not _PICKLE_KEY_UNSET and arg is not None:
-            key = self._coerce_pickle_key(arg, source='pickle_key argument')
-            self._pickle_key_resolved = key
-            return key
-
-        env_value = os.environ.get(PICKLE_KEY_ENV)
-        if env_value:
-            key = self._coerce_pickle_key(
-                env_value, source='%s environment variable' % PICKLE_KEY_ENV
-            )
-            self._pickle_key_resolved = key
-            return key
-
-        key_path = op.join(self._directory, PICKLE_KEY_FILENAME)
-        key = self._read_or_create_pickle_key_file(key_path)
-        if not self._pickle_key_warned:
-            warnings.warn(
-                'DiskCache auto-generated a pickle HMAC key at %r. This '
-                'detects accidental cache corruption but does NOT '
-                'protect against attackers with read access to the '
-                'cache directory (CVE-2025-69872). For stronger '
-                'protection, set the %s environment variable to a '
-                'hex-encoded random key (>= %d bytes), or pass '
-                'pickle_key=... explicitly.'
-                % (key_path, PICKLE_KEY_ENV, PICKLE_KEY_MIN_LEN),
-                UnsafePickleWarning,
-                stacklevel=4,
-            )
+        key, source = _resolve_pickle_key_for_directory(
+            self._directory, self._pickle_key_arg
+        )
+        if not self._pickle_key_warned and _emit_pickle_key_warning(
+            source, self._directory, stacklevel=4
+        ):
             self._pickle_key_warned = True
         self._pickle_key_resolved = key
         return key
-
-    @staticmethod
-    def _coerce_pickle_key(value, source):
-        if isinstance(value, str):
-            try:
-                key = bytes.fromhex(value)
-            except ValueError:
-                raise ValueError(
-                    '%s must be hex-encoded bytes' % source
-                ) from None
-        elif isinstance(value, (bytes, bytearray)):
-            key = bytes(value)
-        else:
-            raise TypeError(
-                '%s must be bytes, bytearray, hex str, False or None; '
-                'got %s' % (source, type(value).__name__)
-            )
-        if len(key) < PICKLE_KEY_MIN_LEN:
-            raise ValueError(
-                '%s must be at least %d bytes (got %d)'
-                % (source, PICKLE_KEY_MIN_LEN, len(key))
-            )
-        return key
-
-    def _read_or_create_pickle_key_file(self, path):
-        # Make sure the cache directory exists; Cache.__init__ usually
-        # already created it but Disk may be used standalone in tests.
-        directory = op.dirname(path) or '.'
-        if not op.isdir(directory):
-            os.makedirs(directory, 0o755)
-
-        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
-        if hasattr(os, 'O_BINARY'):
-            flags |= os.O_BINARY
-        try:
-            fd = os.open(path, flags, 0o600)
-        except FileExistsError:
-            with open(path, 'rb') as reader:
-                data = reader.read()
-            if len(data) < PICKLE_KEY_MIN_LEN:
-                raise RuntimeError(
-                    'DiskCache pickle key file %r is too short (%d < %d); '
-                    'remove it to regenerate, or supply pickle_key='
-                    'explicitly.'
-                    % (path, len(data), PICKLE_KEY_MIN_LEN)
-                )
-            return data
-        else:
-            try:
-                new_key = secrets.token_bytes(32)
-                os.write(fd, new_key)
-            finally:
-                os.close(fd)
-            with cl.suppress(OSError):
-                os.chmod(path, 0o600)
-            return new_key
 
     def _pickle_dump(self, obj, optimize=False):
         """Pickle ``obj`` and wrap with HMAC envelope (or raw bytes if
@@ -512,6 +602,35 @@ class Disk:
                     writer.write(chunk)
                 return size
 
+    def _safe_filename_path(self, filename):
+        """Return a safe full path for a database-stored ``filename``.
+
+        Cache filenames are generated by :meth:`filename` and consist
+        of a randomly generated hex subdirectory and basename.  An
+        attacker with write access to ``cache.db`` could replace a
+        row's ``filename`` column with a path-traversal string (e.g.
+        ``../../../etc/passwd``) to coerce DiskCache into reading
+        arbitrary files outside the cache directory.  This guard
+        refuses any ``filename`` whose resolved location is not
+        strictly inside ``self._directory``.
+
+        :raises ValueError: if ``filename`` escapes the cache directory.
+        """
+        if not isinstance(filename, str):
+            raise ValueError(
+                'diskcache: cache filename must be str, got %s'
+                % type(filename).__name__
+            )
+        base = op.realpath(self._directory)
+        full = op.realpath(op.join(self._directory, filename))
+        if full != base and not full.startswith(base + os.sep):
+            raise ValueError(
+                'diskcache: cache filename %r escapes cache directory '
+                '(refusing path traversal; cache.db may have been '
+                'tampered with).' % (filename,)
+            )
+        return full
+
     def fetch(self, mode, filename, value, read):
         """Convert fields `mode`, `filename`, and `value` from Cache table to
         value.
@@ -527,19 +646,20 @@ class Disk:
         # pylint: disable=unidiomatic-typecheck,consider-using-with
         if mode == MODE_RAW:
             return bytes(value) if type(value) is sqlite3.Binary else value
-        elif mode == MODE_BINARY:
+        if filename is not None:
+            full_path = self._safe_filename_path(filename)
+        if mode == MODE_BINARY:
             if read:
-                return open(op.join(self._directory, filename), 'rb')
+                return open(full_path, 'rb')
             else:
-                with open(op.join(self._directory, filename), 'rb') as reader:
+                with open(full_path, 'rb') as reader:
                     return reader.read()
         elif mode == MODE_TEXT:
-            full_path = op.join(self._directory, filename)
             with open(full_path, 'r', encoding='UTF-8') as reader:
                 return reader.read()
         elif mode == MODE_PICKLE:
             if value is None:
-                with open(op.join(self._directory, filename), 'rb') as reader:
+                with open(full_path, 'rb') as reader:
                     return self._pickle_load_file(reader)
             else:
                 return self._pickle_load_bytes(value)
@@ -579,7 +699,20 @@ class Disk:
         :param str file_path: relative path to file
 
         """
-        full_path = op.join(self._directory, file_path)
+        try:
+            full_path = self._safe_filename_path(file_path)
+        except ValueError:
+            # CVE-2025-69872: refuse to act on tampered filenames that
+            # escape the cache directory.  Do NOT raise -- this is
+            # called from eviction/cull paths that should be tolerant.
+            warnings.warn(
+                'diskcache: refusing to remove file %r (escapes cache '
+                'directory; cache.db may be tampered).' % (file_path,),
+                UnsafePickleWarning,
+                stacklevel=2,
+            )
+            return
+
         full_dir, _ = op.split(full_path)
 
         # Suppress OSError that may occur if two caches attempt to delete the
@@ -735,6 +868,12 @@ class Cache:
             )
         except sqlite3.OperationalError:
             current_settings = {}
+
+        # CVE-2025-69872: ``disk_pickle_key`` MUST be constructor-only.
+        # If a stale row was injected into Settings (by an older
+        # patched build, manual edit, or attacker), drop it so it can
+        # neither be re-persisted nor flow into the Disk constructor.
+        current_settings.pop('disk_pickle_key', None)
 
         sets = DEFAULT_SETTINGS.copy()
         sets.update(current_settings)
@@ -2249,10 +2388,15 @@ class Cache:
                         if DBNAME in full_path:
                             continue
 
-                        if op.basename(full_path) == PICKLE_KEY_FILENAME:
+                        if full_path == op.join(
+                            self._directory, PICKLE_KEY_FILENAME
+                        ):
                             # CVE-2025-69872: auto-generated HMAC key
                             # file lives at the root of the cache dir
                             # and is not tracked in the Cache table.
+                            # Anchor the comparison to the root so a
+                            # tampered file with the same basename in
+                            # a subdirectory is NOT silently preserved.
                             continue
 
                         message = 'unknown file: %s' % full_path
@@ -2650,6 +2794,25 @@ class Cache:
         return self.reset('count')
 
     def __getstate__(self):
+        # CVE-2025-69872: an explicit pickle_key cannot survive
+        # Cache pickling because __getstate__ deliberately serializes
+        # only directory/timeout/disk-type (the secret is intentionally
+        # NOT placed in pickled state).  Refuse rather than silently
+        # regenerate a different key in the receiving process and
+        # corrupt subsequent reads.  ``pickle_key=False`` (legacy mode)
+        # is also refused because the receiver would default to secure
+        # mode and reject the same data.
+        disk = self._disk
+        arg = getattr(disk, '_pickle_key_arg', _PICKLE_KEY_UNSET)
+        if arg is not _PICKLE_KEY_UNSET and arg is not None:
+            raise TypeError(
+                'diskcache: Cache instances configured with an explicit '
+                'disk_pickle_key (or disk_pickle_key=False) cannot be '
+                'pickled because the secret is not placed in pickle '
+                'state. Pickle the cache directory path instead and '
+                'reconstruct Cache(directory, disk_pickle_key=...) in '
+                'the receiving process. (CVE-2025-69872)'
+            )
         return (self.directory, self.timeout, type(self.disk))
 
     def __setstate__(self, state):

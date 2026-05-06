@@ -4,12 +4,22 @@ import contextlib as cl
 import functools
 import itertools as it
 import operator
+import os
 import os.path as op
 import sqlite3
 import tempfile
 import time
 
-from .core import DEFAULT_SETTINGS, ENOVAL, Cache, Disk, Timeout
+from .core import (
+    DEFAULT_SETTINGS,
+    ENOVAL,
+    Cache,
+    Disk,
+    Timeout,
+    _emit_pickle_key_warning,
+    _PICKLE_KEY_UNSET,
+    _resolve_pickle_key_for_directory,
+)
 from .persistent import Deque, Index
 
 
@@ -25,7 +35,13 @@ class FanoutCache:
         :param int shards: number of shards to distribute writes
         :param float timeout: SQLite connection timeout
         :param disk: `Disk` instance for serialization
-        :param settings: any of `DEFAULT_SETTINGS`
+        :param settings: any of `DEFAULT_SETTINGS`, plus the optional
+            non-persistent ``disk_pickle_key`` argument used to verify
+            pickle envelopes (CVE-2025-69872).  See
+            :class:`diskcache.Disk` for accepted values.  The key is
+            resolved once at the FanoutCache root and forwarded to all
+            shards so sharding stays deterministic across processes
+            and a single warning is emitted in default mode.
 
         """
         if directory is None:
@@ -37,6 +53,21 @@ class FanoutCache:
         default_size_limit = DEFAULT_SETTINGS['size_limit']
         size_limit = settings.pop('size_limit', default_size_limit) / shards
 
+        # CVE-2025-69872: resolve the pickle HMAC key once at the
+        # FanoutCache root.  Without this, each shard would
+        # independently auto-generate its own ``.diskcache_pickle_key``
+        # file -- making sharding non-deterministic across processes
+        # (FanoutCache._hash uses shard 0's key but storage may land in
+        # shard N which holds a different key) and emitting one
+        # warning per shard.
+        pickle_key_arg = settings.pop('disk_pickle_key', _PICKLE_KEY_UNSET)
+        if not op.isdir(directory):
+            os.makedirs(directory, 0o755, exist_ok=True)
+        resolved_key, source = _resolve_pickle_key_for_directory(
+            directory, pickle_key_arg
+        )
+        _emit_pickle_key_warning(source, directory, stacklevel=3)
+
         self._count = shards
         self._directory = directory
         self._disk = disk
@@ -46,10 +77,15 @@ class FanoutCache:
                 timeout=timeout,
                 disk=disk,
                 size_limit=size_limit,
+                disk_pickle_key=resolved_key,
                 **settings,
             )
             for num in range(shards)
         )
+        # Suppress per-shard warnings: the FanoutCache already emitted
+        # one above for the entire ensemble.
+        for shard in self._shards:
+            shard._disk._pickle_key_warned = True
         self._hash = self._shards[0].disk.hash
         self._caches = {}
         self._deques = {}

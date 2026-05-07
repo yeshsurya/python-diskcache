@@ -175,12 +175,16 @@ def _read_or_create_pickle_key_file(path):
                 delay *= 2
                 continue
 
+            # ``from None`` suppresses the implicit ``FileExistsError``
+            # context (pylint W0707): the chained exception is just the
+            # race-loop bookkeeping, not a real cause that operators need
+            # to debug.
             raise RuntimeError(
                 'diskcache: pickle key file %r is too short (%d < %d) '
                 'after %d retries; it may be corrupted -- remove it to '
-                'regenerate, or pass pickle_key= explicitly.'
+                'regenerate, or pass disk_pickle_key= explicitly.'
                 % (path, last_short_len, PICKLE_KEY_MIN_LEN, attempt + 1)
-            )
+            ) from None
 
         # We won the race.  Generate and write the key.  Use try/finally
         # so we clean up the half-baked file even on KeyboardInterrupt /
@@ -218,8 +222,27 @@ def _read_or_create_pickle_key_file(path):
             with cl.suppress(OSError):
                 os.close(fd)
             if not write_succeeded:
-                with cl.suppress(OSError):
-                    os.unlink(path)
+                # CVE-2025-69872 (Y1): an async exception
+                # (``KeyboardInterrupt`` / ``SystemExit``) may have
+                # fired AFTER ``os.write`` deposited the full key in
+                # the kernel but BEFORE ``write_succeeded = True`` ran.
+                # Concurrent readers can already see that key, so
+                # unlinking it here would trigger
+                # ``RuntimeError: too short`` for every future
+                # process and silently change the HMAC key in any
+                # reader still holding the old bytes.  Re-read the
+                # file: if it matches the key we just generated, the
+                # write actually completed -- preserve it.
+                try:
+                    with open(path, 'rb') as fh:
+                        on_disk = fh.read()
+                    if on_disk == new_key:
+                        write_succeeded = True
+                except OSError:
+                    pass
+                if not write_succeeded:
+                    with cl.suppress(OSError):
+                        os.unlink(path)
 
         with cl.suppress(OSError):
             os.chmod(path, 0o600)
@@ -273,7 +296,7 @@ def _emit_pickle_key_warning(source, directory, stacklevel):
     if source == _PKEY_SRC_DISABLED:
         warnings.warn(
             'diskcache: pickle HMAC verification is disabled '
-            '(pickle_key=False). The cache directory must be fully '
+            '(disk_pickle_key=False). The cache directory must be fully '
             'trusted; an attacker with write access can achieve '
             'arbitrary code execution via CVE-2025-69872.',
             UnsafePickleWarning,
@@ -291,13 +314,14 @@ def _emit_pickle_key_warning(source, directory, stacklevel):
             'directory before the legitimate process initializes (and '
             'thereby controls the key). For production use set the %s '
             'environment variable to a hex-encoded random key '
-            '(>= %d bytes), or pass pickle_key=... explicitly.'
+            '(>= %d bytes), or pass disk_pickle_key=... explicitly.'
             % (key_path, PICKLE_KEY_ENV, PICKLE_KEY_MIN_LEN),
             UnsafePickleWarning,
             stacklevel=stacklevel,
         )
         return True
     return False
+
 
 MODE_NONE = 0
 MODE_RAW = 1
@@ -684,6 +708,17 @@ class Disk:
                 'cache.db may be tampered)' % (filename, exc)
             ) from exc
         except OSError as exc:
+            # CVE-2025-69872 (Y2): a symlink loop (errno ELOOP) inside
+            # the cache directory surfaces as a generic ``OSError`` from
+            # ``os.path.realpath``.  Without translation the caller
+            # would see an opaque OSError instead of the path-traversal
+            # signal it expects, masking a tampered cache.db that
+            # points at a self-referential symlink chain.
+            if getattr(exc, 'errno', None) == errno.ELOOP:
+                raise ValueError(
+                    'diskcache: cannot resolve cache filename %r (%s; '
+                    'cache.db may be tampered)' % (filename, exc)
+                ) from exc
             # Windows-only: UNC / drive-not-found surface as bare
             # OSError or WinError 53 / 67 / 87 / 123 / 161 (path/name
             # invalid for filesystem use).  Treat as malformed
@@ -927,10 +962,33 @@ class Cache:
         # CVE-2025-69872: ``disk_pickle_key`` is intentionally treated as
         # constructor-only configuration.  Persisting it in the Settings
         # table would either leak the secret into the same compromised
-        # cache directory or let an attacker make ``pickle_key=False``
+        # cache directory or let an attacker make ``disk_pickle_key=False``
         # sticky across restarts via ``cache.reset``.  Pop it before any
         # of the regular settings plumbing runs.
         pickle_key = settings.pop('disk_pickle_key', _PICKLE_KEY_UNSET)
+        # CVE-2025-69872 (O1+O4 link): ``_disk_pickle_key_inherited`` is
+        # a private kwarg used by :class:`FanoutCache` and the
+        # ``_copy_for_same_process`` helpers to forward an
+        # already-resolved key (env var, on-disk file, parent shard)
+        # WITHOUT marking the child as user-explicit.  When set, the
+        # child Cache stays pickleable in default mode (its
+        # ``_pickle_key_arg`` remains :data:`_PICKLE_KEY_UNSET`) but
+        # uses the parent's resolved key so sharding/copying remain
+        # deterministic across env/file changes.
+        inherited_key = settings.pop('_disk_pickle_key_inherited', None)
+        # CVE-2025-69872 (Y3): pre-validate the user-explicit key with
+        # the public kwarg name in the error message.  Without this
+        # the failure surfaces from Disk's own validation as
+        # "pickle_key argument" -- confusing for users who only
+        # passed ``disk_pickle_key=``.
+        if (
+            pickle_key is not _PICKLE_KEY_UNSET
+            and pickle_key is not None
+            and pickle_key is not False
+        ):
+            pickle_key = _coerce_pickle_key(
+                pickle_key, source='disk_pickle_key argument'
+            )
 
         if directory is None:
             directory = tempfile.mkdtemp(prefix='diskcache-')
@@ -1002,9 +1060,24 @@ class Cache:
         # it -- but Settings tables created by older patched builds or
         # by hand could in principle contain one).
         kwargs.pop('pickle_key', None)
+        kwargs.pop('_disk_pickle_key_inherited', None)
         if pickle_key is not _PICKLE_KEY_UNSET:
             kwargs['pickle_key'] = pickle_key
         self._disk = disk(directory, **kwargs)
+
+        # CVE-2025-69872 (O4): apply an inherited key (from a
+        # FanoutCache parent or ``_copy_for_same_process``) AFTER disk
+        # construction so it shows up only as ``_pickle_key_resolved``
+        # -- never as ``_pickle_key_arg``.  This keeps default-mode
+        # child Caches and copies pickleable while still forcing them
+        # to use the same HMAC key as the parent (otherwise sharded
+        # and copied caches would diverge from the original key).
+        if (
+            inherited_key is not None
+            and pickle_key is _PICKLE_KEY_UNSET
+        ):
+            self._disk._pickle_key_resolved = inherited_key
+            self._disk._pickle_key_warned = True
 
         # Set cached attributes: updates settings and sets pragmas.
 
@@ -2932,24 +3005,26 @@ class Cache:
             # Forward bytes / False explicitly so the new instance has
             # the same security posture as the original.
             kwargs['disk_pickle_key'] = arg
+        # CVE-2025-69872 V15 / O1: if the original lazily resolved its
+        # HMAC key from env / file, propagate the resolved bytes via
+        # the private ``_disk_pickle_key_inherited`` channel so an
+        # intervening change to ``DISKCACHE_PICKLE_KEY`` or
+        # ``.diskcache_pickle_key`` doesn't produce a copy with a
+        # different key (which would silently fail HMAC verification).
+        # Inherited keys leave ``_pickle_key_arg`` UNSET so the copy
+        # remains pickleable in default mode.
+        if (
+            arg is _PICKLE_KEY_UNSET
+            and getattr(disk, '_pickle_key_resolved', None) is not None
+            and disk._pickle_key_resolved is not False
+        ):
+            kwargs['_disk_pickle_key_inherited'] = disk._pickle_key_resolved
         new = self.__class__(
             self.directory,
             timeout=self.timeout,
             disk=type(self.disk),
             **kwargs,
         )
-        # CVE-2025-69872 V15: if the original has already lazily
-        # resolved its HMAC key from env / file, propagate the
-        # resolved bytes to the copy so an intervening change to
-        # ``DISKCACHE_PICKLE_KEY`` or ``.diskcache_pickle_key`` does
-        # not produce a copy that uses a different key than the
-        # original (which would silently fail HMAC verification).
-        if (
-            arg is _PICKLE_KEY_UNSET
-            and getattr(disk, '_pickle_key_resolved', None) is not None
-        ):
-            new._disk._pickle_key_resolved = disk._pickle_key_resolved
-            new._disk._pickle_key_warned = True
         return new
 
     def reset(self, key, value=ENOVAL, update=True):

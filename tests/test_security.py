@@ -1524,3 +1524,309 @@ def test_v21_legacy_error_mentions_disk_pickle_key(
         'Error must reference the public kwarg name disk_pickle_key '
         '(not the Disk-only pickle_key); got: %r' % msg
     )
+
+
+# -- Pass-5: O1 default-mode copies survive env changes ----------------
+
+
+def test_o1_default_mode_cache_copy_survives_env_change(
+    tmp_cache_dir, monkeypatch
+):
+    """O1 (Cache): copy.copy(cache) in default mode must keep using the
+    original key even if DISKCACHE_PICKLE_KEY is replaced before the
+    copy is constructed."""
+    import copy
+
+    monkeypatch.setenv(PICKLE_KEY_ENV, secrets.token_bytes(32).hex())
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.Cache(tmp_cache_dir) as cache:
+            cache['k'] = {'v': 1}
+            assert cache['k'] == {'v': 1}  # force lazy resolution
+            monkeypatch.setenv(PICKLE_KEY_ENV, secrets.token_bytes(32).hex())
+            shallow = copy.copy(cache)
+            try:
+                assert shallow['k'] == {'v': 1}
+            finally:
+                shallow.close()
+
+
+def test_o1_default_mode_fanout_copy_survives_env_change(
+    tmp_cache_dir, monkeypatch
+):
+    """O1 (FanoutCache): copy.copy(fc) must keep using the original key
+    even if DISKCACHE_PICKLE_KEY is replaced before the copy is made.
+    Without the inherited-key propagation the copy would re-resolve
+    from the (now different) env var and silently fail HMAC."""
+    import copy
+
+    monkeypatch.setenv(PICKLE_KEY_ENV, secrets.token_bytes(32).hex())
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.FanoutCache(tmp_cache_dir, shards=4) as fc:
+            fc['k'] = {'v': 1}
+            assert fc['k'] == {'v': 1}
+            monkeypatch.setenv(PICKLE_KEY_ENV, secrets.token_bytes(32).hex())
+            shallow = copy.copy(fc)
+            try:
+                assert shallow['k'] == {'v': 1}
+            finally:
+                shallow.close()
+
+
+def test_o1_default_mode_deque_copy_survives_env_change(
+    tmp_cache_dir, monkeypatch
+):
+    """O1 (Deque): copy.copy(deque) must keep the original key."""
+    import copy
+
+    monkeypatch.setenv(PICKLE_KEY_ENV, secrets.token_bytes(32).hex())
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        deque = dc.Deque(directory=tmp_cache_dir)
+        try:
+            deque.append({'v': 1})
+            assert list(deque) == [{'v': 1}]
+            monkeypatch.setenv(PICKLE_KEY_ENV, secrets.token_bytes(32).hex())
+            shallow = copy.copy(deque)
+            try:
+                assert list(shallow) == [{'v': 1}]
+            finally:
+                shallow._cache.close()
+        finally:
+            deque._cache.close()
+
+
+def test_o1_default_mode_index_copy_survives_env_change(
+    tmp_cache_dir, monkeypatch
+):
+    """O1 (Index): copy.copy(index) must keep the original key."""
+    import copy
+
+    monkeypatch.setenv(PICKLE_KEY_ENV, secrets.token_bytes(32).hex())
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        idx = dc.Index(tmp_cache_dir)
+        try:
+            idx['k'] = {'v': 1}
+            assert idx['k'] == {'v': 1}
+            monkeypatch.setenv(PICKLE_KEY_ENV, secrets.token_bytes(32).hex())
+            shallow = copy.copy(idx)
+            try:
+                assert shallow['k'] == {'v': 1}
+            finally:
+                shallow._cache.close()
+        finally:
+            idx._cache.close()
+
+
+# -- Pass-5: O2 FanoutCache children get-or-create lock ----------------
+
+
+def test_o2_fanout_concurrent_cache_no_duplicate(tmp_cache_dir, clear_env):
+    """O2: two threads calling fc.cache('foo') simultaneously must get
+    the SAME instance.  Without the lock, both can miss the dict, both
+    construct, the second store overwrites the first, and the first
+    caller is left with an orphan Cache (open SQLite handle, no
+    references in fc._caches)."""
+    import threading
+
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.FanoutCache(tmp_cache_dir, shards=2) as fc:
+            results = []
+            barrier = threading.Barrier(8)
+
+            def grab():
+                barrier.wait()
+                results.append(fc.cache('shared'))
+
+            threads = [threading.Thread(target=grab) for _ in range(8)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+            first = results[0]
+            assert all(r is first for r in results), (
+                'All threads must see the same cached child instance'
+            )
+            assert len(fc._caches) == 1
+
+
+# -- Pass-5: O3 close() closes cached children -------------------------
+
+
+def test_o3_fanout_close_closes_children(tmp_cache_dir, clear_env):
+    """O3: ``fc.close()`` must close cached child Cache/Deque/Index
+    instances.  Otherwise long-lived references leak SQLite handles.
+
+    We can't assert ``set()`` raises post-close because :meth:`Cache.set`
+    lazily reopens its thread-local connection.  Instead assert the
+    invariants close() must establish: the per-thread SQLite
+    connection on each child is gone, and the FanoutCache no longer
+    holds references in its caches/deques/indexes dicts.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        fc = dc.FanoutCache(tmp_cache_dir, shards=2)
+        child_cache = fc.cache('child_cache')
+        child_deque = fc.deque('child_deque')
+        child_index = fc.index('child_index')
+        # Force connection creation in this thread.
+        child_cache['k'] = 1
+        child_deque.append('x')
+        child_index['a'] = 1
+        # Sanity: connections currently exist.
+        assert getattr(child_cache._local, 'con', None) is not None
+        assert getattr(child_deque._cache._local, 'con', None) is not None
+        assert getattr(child_index._cache._local, 'con', None) is not None
+
+        fc.close()
+
+        # Each cached child must have had its connection closed.
+        assert getattr(child_cache._local, 'con', None) is None, (
+            'O3: fc.close() did not close the cached child Cache'
+        )
+        assert getattr(child_deque._cache._local, 'con', None) is None, (
+            'O3: fc.close() did not close the cached child Deque cache'
+        )
+        assert getattr(child_index._cache._local, 'con', None) is None, (
+            'O3: fc.close() did not close the cached child Index cache'
+        )
+
+        # The dicts must be cleared so the parent can be safely
+        # reopened later without leaking the old children.
+        assert fc._caches == {}
+        assert fc._deques == {}
+        assert fc._indexes == {}
+
+
+# -- Pass-5: O4 child Cache pickling depends on key source -------------
+
+
+def test_o4_default_mode_child_cache_pickleable(tmp_cache_dir, clear_env):
+    """O4: in default mode the FanoutCache and its child Cache must
+    be pickleable -- the inherited key isn't a user-supplied secret."""
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.FanoutCache(tmp_cache_dir, shards=2) as fc:
+            child = fc.cache('foo')
+            # The child must NOT have an explicit _pickle_key_arg.
+            from diskcache.core import _PICKLE_KEY_UNSET
+            assert child._disk._pickle_key_arg is _PICKLE_KEY_UNSET
+            # And it must be pickleable.
+            blob = pickle.dumps(child)
+            restored = pickle.loads(blob)
+            try:
+                assert restored.directory == child.directory
+            finally:
+                restored.close()
+
+
+def test_o4_explicit_mode_child_cache_unpickleable(
+    tmp_cache_dir, clear_env
+):
+    """O4: when the user passes an explicit ``disk_pickle_key`` to
+    FanoutCache, the child Cache inherits that explicit key and
+    pickling must be refused (mirrors the parent's posture)."""
+    secret = secrets.token_bytes(32)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.FanoutCache(
+            tmp_cache_dir, shards=2, disk_pickle_key=secret
+        ) as fc:
+            child = fc.cache('foo')
+            with pytest.raises(TypeError, match='disk_pickle_key'):
+                pickle.dumps(child)
+
+
+# -- Pass-5: Y1 KeyboardInterrupt after full write preserves key file --
+
+
+def test_y1_keyboard_interrupt_after_full_write_preserves_file(
+    tmp_cache_dir, clear_env, monkeypatch
+):
+    """Y1: if KeyboardInterrupt fires AFTER os.write has deposited the
+    full key in the kernel but BEFORE ``write_succeeded = True`` runs,
+    the finally block must NOT unlink the file -- concurrent readers
+    can already see that key bytes."""
+    from diskcache import core as dc_core
+
+    real_write = os.write
+
+    def evil_write(fd, data):
+        n = real_write(fd, data)
+        # Simulate an async exception firing right after os.write
+        # returned the full count -- before the assignment below.
+        raise KeyboardInterrupt('simulated SIGINT')
+
+    monkeypatch.setattr(dc_core.os, 'write', evil_write)
+    keyfile = op.join(tmp_cache_dir, PICKLE_KEY_FILENAME)
+    with pytest.raises(KeyboardInterrupt):
+        dc_core._read_or_create_pickle_key_file(keyfile)
+    # Restore real os.write for the assertion phase.
+    monkeypatch.setattr(dc_core.os, 'write', real_write)
+
+    # File must still exist with a valid key (>= MIN_LEN bytes).
+    assert op.exists(keyfile), (
+        'Y1: file was unlinked even though os.write completed -- '
+        'concurrent readers may already hold this key.'
+    )
+    with open(keyfile, 'rb') as fh:
+        on_disk = fh.read()
+    assert len(on_disk) >= dc_core.PICKLE_KEY_MIN_LEN
+
+
+# -- Pass-5: Y2 ELOOP translates to ValueError -------------------------
+
+
+@pytest.mark.skipif(
+    os.name == 'nt', reason='symlink loops require admin on Windows'
+)
+def test_y2_eloop_translates_to_value_error(tmp_cache_dir, clear_env):
+    """Y2: a symlink loop inside the cache directory (errno ELOOP)
+    must surface as ValueError from _safe_filename_path, signalling
+    a tampered cache.db row -- not as an opaque OSError."""
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.Cache(tmp_cache_dir) as cache:
+            disk = cache._disk
+            # Create a symlink loop a -> b -> a inside the cache dir.
+            a = op.join(tmp_cache_dir, 'loop_a')
+            b = op.join(tmp_cache_dir, 'loop_b')
+            try:
+                os.symlink(b, a)
+                os.symlink(a, b)
+            except (OSError, NotImplementedError) as exc:
+                pytest.skip('cannot create symlink loop: %s' % exc)
+            with pytest.raises(ValueError, match='cache.db may be tampered'):
+                disk._safe_filename_path('loop_a')
+
+
+# -- Pass-5: Y3 error wording uses the public kwarg name --------------
+
+
+def test_y3_error_message_uses_disk_pickle_key_kwarg_name(
+    tmp_cache_dir, clear_env
+):
+    """Y3: ``Cache(td, disk_pickle_key='not-hex')`` must raise with
+    the public kwarg name (``disk_pickle_key``) in the error so users
+    aren't confused by the underlying ``Disk(pickle_key=...)`` kwarg
+    they never typed."""
+    with pytest.raises(ValueError) as exc_info:
+        dc.Cache(tmp_cache_dir, disk_pickle_key='not-hex')
+    msg = str(exc_info.value)
+    assert 'disk_pickle_key' in msg, (
+        'error must mention the public kwarg disk_pickle_key, got: %r'
+        % msg
+    )
+
+    # FanoutCache should also use the public name.
+    with pytest.raises(ValueError) as exc_info2:
+        dc.FanoutCache(tmp_cache_dir, disk_pickle_key='not-hex')
+    msg2 = str(exc_info2.value)
+    assert 'disk_pickle_key' in msg2, (
+        'FanoutCache error must mention disk_pickle_key, got: %r' % msg2
+    )
+

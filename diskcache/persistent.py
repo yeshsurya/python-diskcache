@@ -357,13 +357,22 @@ class Deque(Sequence):
         return self._copy_for_same_process()
 
     def _copy_for_same_process(self):
-        # CVE-2025-69872 V19: same-process Deque copy preserves the
+        # CVE-2025-69872 V19/O1: same-process Deque copy preserves the
         # underlying Cache's explicit pickle_key so the copy stays
-        # readable.  Default-mode caches re-resolve from env / file.
+        # readable.  Default-mode caches forward the already-resolved
+        # key via the private inherited channel so env / file changes
+        # between calls don't produce a copy that disagrees with the
+        # original on the HMAC key.
         cache = self._cache
         arg = getattr(cache._disk, '_pickle_key_arg', _PICKLE_KEY_UNSET)
         if arg is not _PICKLE_KEY_UNSET and arg is not None:
             new_cache = Cache(self.directory, disk_pickle_key=arg)
+            return type(self).fromcache(new_cache, maxlen=self.maxlen)
+        resolved = getattr(cache._disk, '_pickle_key_resolved', None)
+        if resolved is not None and resolved is not False:
+            new_cache = Cache(
+                self.directory, _disk_pickle_key_inherited=resolved
+            )
             return type(self).fromcache(new_cache, maxlen=self.maxlen)
         return type(self)(directory=self.directory, maxlen=self.maxlen)
 
@@ -1145,12 +1154,21 @@ class Index(MutableMapping):
         return self._copy_for_same_process()
 
     def _copy_for_same_process(self):
-        # CVE-2025-69872 V19: same-process Index copy preserves the
-        # underlying Cache's explicit pickle_key.
+        # CVE-2025-69872 V19/O1: same-process Index copy preserves the
+        # underlying Cache's explicit pickle_key.  Default-mode caches
+        # forward the already-resolved key via the private inherited
+        # channel so env / file changes between calls don't produce a
+        # copy that disagrees with the original on the HMAC key.
         cache = self._cache
         arg = getattr(cache._disk, '_pickle_key_arg', _PICKLE_KEY_UNSET)
         if arg is not _PICKLE_KEY_UNSET and arg is not None:
             new_cache = Cache(self.directory, disk_pickle_key=arg)
+            return type(self).fromcache(new_cache)
+        resolved = getattr(cache._disk, '_pickle_key_resolved', None)
+        if resolved is not None and resolved is not False:
+            new_cache = Cache(
+                self.directory, _disk_pickle_key_inherited=resolved
+            )
             return type(self).fromcache(new_cache)
         return type(self)(self.directory)
 

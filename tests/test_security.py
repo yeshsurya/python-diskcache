@@ -20,6 +20,7 @@ import sqlite3
 import sys
 import tempfile
 import warnings
+import errno
 
 import pytest
 
@@ -569,13 +570,25 @@ def test_fanoutcache_default_emits_one_warning(tmp_cache_dir, clear_env):
         % len(pkey_warnings)
     )
 
-    # Root-level key file exists; no shard-level key files.
-    assert op.exists(op.join(tmp_cache_dir, PICKLE_KEY_FILENAME))
+    # Root-level key file exists; CVE-2025-69872 (L1) shards now ALSO
+    # mirror the same key file into their own directory so a process
+    # that opens a shard directly as ``Cache(shard_dir)`` can recover
+    # the same HMAC key via default resolution.  All copies must
+    # equal the root key.
+    root_key_path = op.join(tmp_cache_dir, PICKLE_KEY_FILENAME)
+    assert op.exists(root_key_path)
+    with open(root_key_path, 'rb') as fh:
+        root_key = fh.read()
     for num in range(4):
         shard_dir = op.join(tmp_cache_dir, '%03d' % num)
-        assert not op.exists(op.join(shard_dir, PICKLE_KEY_FILENAME)), (
-            'shard %d must not have its own key file' % num
+        shard_key_path = op.join(shard_dir, PICKLE_KEY_FILENAME)
+        assert op.exists(shard_key_path), (
+            'L1: shard %d must mirror the root key file' % num
         )
+        with open(shard_key_path, 'rb') as fh:
+            assert fh.read() == root_key, (
+                'L1: shard %d key file must equal root key' % num
+            )
 
 
 def test_fanoutcache_two_instances_share_default_key(
@@ -1623,35 +1636,75 @@ def test_o1_default_mode_index_copy_survives_env_change(
 # -- Pass-5: O2 FanoutCache children get-or-create lock ----------------
 
 
-def test_o2_fanout_concurrent_cache_no_duplicate(tmp_cache_dir, clear_env):
+def test_o2_fanout_concurrent_cache_no_duplicate(
+    tmp_cache_dir, clear_env, monkeypatch
+):
     """O2: two threads calling fc.cache('foo') simultaneously must get
     the SAME instance.  Without the lock, both can miss the dict, both
     construct, the second store overwrites the first, and the first
     caller is left with an orphan Cache (open SQLite handle, no
-    references in fc._caches)."""
+    references in fc._caches).
+
+    This version is deterministic: we monkey-patch ``Cache.__init__``
+    with a wrapper that sleeps before returning, so both threads enter
+    the get-or-create critical section while the first construction
+    is still in flight.  Without the lock the second thread observes
+    an empty ``self._caches`` and constructs a duplicate.
+    """
     import threading
+    import time
+
+    real_init = dc.Cache.__init__
+    construct_count = {'n': 0}
+    construct_lock = threading.Lock()
+
+    def slow_init(self, *args, **kwargs):
+        with construct_lock:
+            construct_count['n'] += 1
+            n = construct_count['n']
+        real_init(self, *args, **kwargs)
+        # Only slow down child cache construction (under the
+        # FanoutCache 'cache' subdirectory), not the FanoutCache's
+        # own shards.  Sleep races the second caller into the
+        # critical section.
+        if n > 0 and 'cache' in str(self.directory).split(os.sep):
+            time.sleep(0.2)
 
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', dc.UnsafePickleWarning)
         with dc.FanoutCache(tmp_cache_dir, shards=2) as fc:
+            # Patch only after FanoutCache is fully constructed so
+            # shard inits aren't slowed.
+            monkeypatch.setattr(dc.Cache, '__init__', slow_init)
+
             results = []
-            barrier = threading.Barrier(8)
+            results_lock = threading.Lock()
 
             def grab():
-                barrier.wait()
-                results.append(fc.cache('shared'))
+                child = fc.cache('shared')
+                with results_lock:
+                    results.append(child)
 
             threads = [threading.Thread(target=grab) for _ in range(8)]
+            t0 = time.time()
             for t in threads:
                 t.start()
             for t in threads:
                 t.join()
+            elapsed = time.time() - t0
 
             first = results[0]
             assert all(r is first for r in results), (
                 'All threads must see the same cached child instance'
             )
             assert len(fc._caches) == 1
+            # If the lock works, all threads serialize on the first
+            # construction (~0.2s); a duplicate construction would
+            # double the time.  Allow generous slack.
+            assert elapsed < 1.0, (
+                'O2: child construction appears to have run more '
+                'than once concurrently (elapsed=%.2fs)' % elapsed
+            )
 
 
 # -- Pass-5: O3 close() closes cached children -------------------------
@@ -1661,11 +1714,13 @@ def test_o3_fanout_close_closes_children(tmp_cache_dir, clear_env):
     """O3: ``fc.close()`` must close cached child Cache/Deque/Index
     instances.  Otherwise long-lived references leak SQLite handles.
 
-    We can't assert ``set()`` raises post-close because :meth:`Cache.set`
-    lazily reopens its thread-local connection.  Instead assert the
-    invariants close() must establish: the per-thread SQLite
-    connection on each child is gone, and the FanoutCache no longer
-    holds references in its caches/deques/indexes dicts.
+    Behavioral check: after ``fc.close()`` we must be able to open a
+    fresh sqlite3 connection to each child's database file in
+    exclusive locking mode.  If close() failed to release the
+    underlying handle (e.g. on Windows where the file is held by the
+    OS while the connection is open), this will fail.  We also assert
+    the parent's child dicts are cleared so the FanoutCache cannot
+    silently keep handing out post-close children.
     """
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', dc.UnsafePickleWarning)
@@ -1677,23 +1732,27 @@ def test_o3_fanout_close_closes_children(tmp_cache_dir, clear_env):
         child_cache['k'] = 1
         child_deque.append('x')
         child_index['a'] = 1
-        # Sanity: connections currently exist.
-        assert getattr(child_cache._local, 'con', None) is not None
-        assert getattr(child_deque._cache._local, 'con', None) is not None
-        assert getattr(child_index._cache._local, 'con', None) is not None
+
+        child_cache_db = op.join(child_cache.directory, 'cache.db')
+        child_deque_db = op.join(child_deque._cache.directory, 'cache.db')
+        child_index_db = op.join(child_index._cache.directory, 'cache.db')
+        assert op.isfile(child_cache_db)
+        assert op.isfile(child_deque_db)
+        assert op.isfile(child_index_db)
 
         fc.close()
 
-        # Each cached child must have had its connection closed.
-        assert getattr(child_cache._local, 'con', None) is None, (
-            'O3: fc.close() did not close the cached child Cache'
-        )
-        assert getattr(child_deque._cache._local, 'con', None) is None, (
-            'O3: fc.close() did not close the cached child Deque cache'
-        )
-        assert getattr(child_index._cache._local, 'con', None) is None, (
-            'O3: fc.close() did not close the cached child Index cache'
-        )
+        # Behavioral verification: each child's db must be openable
+        # by a fresh exclusive-locking sqlite connection.  If the
+        # original connection is still held, the BEGIN EXCLUSIVE will
+        # raise OperationalError (database is locked).
+        for db_path in (child_cache_db, child_deque_db, child_index_db):
+            con = sqlite3.connect(db_path, timeout=0.5)
+            try:
+                con.execute('BEGIN EXCLUSIVE')
+                con.execute('COMMIT')
+            finally:
+                con.close()
 
         # The dicts must be cleared so the parent can be safely
         # reopened later without leaking the old children.
@@ -1830,3 +1889,210 @@ def test_y3_error_message_uses_disk_pickle_key_kwarg_name(
         'FanoutCache error must mention disk_pickle_key, got: %r' % msg2
     )
 
+
+
+# -- Pass-6: L1 child cache key recoverability after pickle ------------
+
+
+def test_l1_pickled_child_cache_recovers_data_in_receiver(
+    tmp_cache_dir, clear_env
+):
+    """L1: pickling a child Cache obtained from FanoutCache.cache(name)
+    must round-trip -- the receiver must be able to recover the HMAC
+    key from the child's directory and read the data."""
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.FanoutCache(tmp_cache_dir, shards=2) as fc:
+            child = fc.cache('mychild')
+            child[('complex', 'key')] = {'value': 42}
+            blob = pickle.dumps(child)
+            child_dir = child.directory
+        # Simulate "receiving process": brand-new Cache instance from
+        # the same directory, no env var.
+        with dc.Cache(child_dir) as rcv:
+            assert rcv[('complex', 'key')] == {'value': 42}
+        # Also test pickle round-trip.
+        rcv2 = pickle.loads(blob)
+        try:
+            assert rcv2[('complex', 'key')] == {'value': 42}
+        finally:
+            rcv2.close()
+
+
+def test_l1_inherited_key_file_written_atomically_in_child_dir(
+    tmp_cache_dir, clear_env
+):
+    """L1: the inherited key must be persisted into the child
+    directory's ``.diskcache_pickle_key`` so default resolution in a
+    receiving process recovers the same key."""
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.FanoutCache(tmp_cache_dir, shards=2) as fc:
+            child = fc.cache('mychild')
+            child_key_path = op.join(child.directory, PICKLE_KEY_FILENAME)
+            assert op.isfile(child_key_path)
+            with open(child_key_path, 'rb') as fh:
+                child_key = fh.read()
+            parent_key_path = op.join(tmp_cache_dir, PICKLE_KEY_FILENAME)
+            with open(parent_key_path, 'rb') as fh:
+                parent_key = fh.read()
+            assert child_key == parent_key
+
+
+def test_l1_explicit_key_does_NOT_write_keyfile_into_child_dir(
+    tmp_cache_dir, clear_env
+):
+    """L1 negative: when the user passes an explicit
+    ``disk_pickle_key`` the secret must NOT be persisted to disk in
+    any child directory.  Only the implicit (inherited from default
+    resolution) path triggers the L1 keyfile-write."""
+    secret = secrets.token_bytes(32)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.FanoutCache(
+            tmp_cache_dir, shards=2, disk_pickle_key=secret
+        ) as fc:
+            child = fc.cache('mychild')
+            assert not op.isfile(
+                op.join(child.directory, PICKLE_KEY_FILENAME)
+            )
+            # Parent dir also should not have one.
+            assert not op.isfile(
+                op.join(tmp_cache_dir, PICKLE_KEY_FILENAME)
+            )
+
+
+def test_l1_legacy_mode_does_NOT_write_keyfile_into_child_dir(
+    tmp_cache_dir, clear_env
+):
+    """L1 negative: legacy mode (disk_pickle_key=False) must not
+    create a keyfile anywhere -- there is no key to persist."""
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.FanoutCache(
+            tmp_cache_dir, shards=2, disk_pickle_key=False
+        ) as fc:
+            child = fc.cache('mychild')
+            assert not op.isfile(
+                op.join(child.directory, PICKLE_KEY_FILENAME)
+            )
+
+
+# -- Pass-6: C1 FanoutCache.close() fences subsequent use --------------
+
+
+def test_c1_fanoutcache_use_after_close_raises(tmp_cache_dir, clear_env):
+    """C1: after fc.close(), creating new children via cache()/
+    deque()/index() must raise RuntimeError."""
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        fc = dc.FanoutCache(tmp_cache_dir, shards=2)
+        fc.cache('existing')  # populate to exercise close() pathways
+        fc.close()
+        with pytest.raises(RuntimeError, match='closed'):
+            fc.cache('new')
+        with pytest.raises(RuntimeError, match='closed'):
+            fc.deque('new')
+        with pytest.raises(RuntimeError, match='closed'):
+            fc.index('new')
+
+
+def test_c1_fanoutcache_close_idempotent(tmp_cache_dir, clear_env):
+    """C1: calling close() twice must not raise."""
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        fc = dc.FanoutCache(tmp_cache_dir, shards=2)
+        fc.close()
+        fc.close()  # second close should not raise
+
+
+# -- Pass-6: L2 size-based finally cleanup -----------------------------
+
+
+def test_y1_finally_size_based_cleanup_partial(
+    tmp_cache_dir, clear_env, monkeypatch
+):
+    """L2: if os.write only delivers a short prefix of the key and
+    then raises OSError, the finally block must unlink the partial
+    file (file_size < len(new_key))."""
+    from diskcache import core as dc_core
+
+    real_write = os.write
+
+    def short_then_fail(fd, data):
+        # Write only 8 bytes and report failure thereafter.
+        real_write(fd, data[:8])
+        raise OSError(28, 'simulated short write + failure')
+
+    monkeypatch.setattr(dc_core.os, 'write', short_then_fail)
+    keyfile = op.join(tmp_cache_dir, PICKLE_KEY_FILENAME)
+    with pytest.raises(OSError):
+        dc_core._read_or_create_pickle_key_file(keyfile)
+    # Restore for cleanup safety.
+    monkeypatch.setattr(dc_core.os, 'write', real_write)
+    assert not op.exists(keyfile), (
+        'L2: partial file (8 bytes < 32) must be unlinked'
+    )
+
+
+def test_y1_finally_size_based_cleanup_complete(
+    tmp_cache_dir, clear_env, monkeypatch
+):
+    """L2: if os.write delivers the full key but an exception fires
+    before write_succeeded=True, the finally block must preserve the
+    file (file_size == len(new_key) and content matches)."""
+    from diskcache import core as dc_core
+
+    real_write = os.write
+
+    def full_then_fail(fd, data):
+        n = real_write(fd, data)
+        # Simulate KeyboardInterrupt firing AFTER full bytes deposited
+        # but BEFORE the write_succeeded=True assignment runs.
+        raise KeyboardInterrupt('simulated SIGINT post-write')
+
+    monkeypatch.setattr(dc_core.os, 'write', full_then_fail)
+    keyfile = op.join(tmp_cache_dir, PICKLE_KEY_FILENAME)
+    with pytest.raises(KeyboardInterrupt):
+        dc_core._read_or_create_pickle_key_file(keyfile)
+    monkeypatch.setattr(dc_core.os, 'write', real_write)
+    assert op.exists(keyfile), (
+        'L2: complete file (32 bytes, content matches) must be preserved'
+    )
+    with open(keyfile, 'rb') as fh:
+        assert len(fh.read()) >= dc_core.PICKLE_KEY_MIN_LEN
+
+
+# -- Pass-6: Y2 cross-platform ELOOP via monkeypatch -------------------
+
+
+def test_y2_eloop_translates_to_value_error_via_monkeypatch(
+    tmp_cache_dir, clear_env, monkeypatch
+):
+    """Y2 (cross-platform): monkey-patch op.realpath to raise
+    OSError(ELOOP) so the translation to ValueError is verified
+    without needing real symlinks (which require admin on Windows)."""
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.Cache(tmp_cache_dir) as cache:
+            disk = cache._disk
+            from diskcache import core as dc_core
+
+            real_realpath = dc_core.op.realpath
+
+            def loop_realpath(path, *args, **kwargs):
+                # Only fake the loop for our specific filename so the
+                # cache directory's own realpath caching still works.
+                if 'loop_target' in str(path):
+                    raise OSError(
+                        errno.ELOOP, 'Too many symbolic links'
+                    )
+                return real_realpath(path, *args, **kwargs)
+
+            monkeypatch.setattr(
+                dc_core.op, 'realpath', loop_realpath
+            )
+            with pytest.raises(
+                ValueError, match='cache.db may be tampered'
+            ):
+                disk._safe_filename_path('loop_target')

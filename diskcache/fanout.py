@@ -155,6 +155,12 @@ class FanoutCache:
         # SQLite database (which would race on initial schema setup
         # and hold separate connection pools).
         self._children_lock = threading.Lock()
+        # CVE-2025-69872 (C1): track close state so cache()/deque()/
+        # index() refuse to construct NEW children after close().
+        # Existing child references obtained before close() remain
+        # usable per :meth:`Cache.close` semantics (per-thread
+        # connection that lazily reopens).
+        self._closed = False
 
     @property
     def directory(self):
@@ -622,6 +628,11 @@ class FanoutCache:
         # open after ``fc.close()``, leaking handles and quietly
         # accepting writes against a "closed" FanoutCache).
         with self._children_lock:
+            # CVE-2025-69872 (C1): mark closed under the lock so any
+            # concurrent cache()/deque()/index() either completes
+            # before us (returning a still-valid child we then close)
+            # or sees ``_closed`` True and refuses cleanly.
+            self._closed = True
             for child in list(self._caches.values()):
                 with cl.suppress(Exception):
                     child.close()
@@ -732,6 +743,13 @@ class FanoutCache:
         """
         # CVE-2025-69872 (O2): double-checked-locking get-or-create.
         with self._children_lock:
+            if self._closed:
+                raise RuntimeError(
+                    'diskcache: FanoutCache is closed; cannot create '
+                    'new children. (Existing child references obtained '
+                    'before close() remain usable per Cache.close() '
+                    'semantics.)'
+                )
             existing = self._caches.get(name)
             if existing is not None:
                 return existing
@@ -771,6 +789,11 @@ class FanoutCache:
 
         """
         with self._children_lock:
+            if self._closed:
+                raise RuntimeError(
+                    'diskcache: FanoutCache is closed; cannot create '
+                    'new children.'
+                )
             existing = self._deques.get(name)
             if existing is not None:
                 return existing
@@ -809,6 +832,11 @@ class FanoutCache:
 
         """
         with self._children_lock:
+            if self._closed:
+                raise RuntimeError(
+                    'diskcache: FanoutCache is closed; cannot create '
+                    'new children.'
+                )
             existing = self._indexes.get(name)
             if existing is not None:
                 return existing

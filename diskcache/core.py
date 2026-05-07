@@ -222,27 +222,40 @@ def _read_or_create_pickle_key_file(path):
             with cl.suppress(OSError):
                 os.close(fd)
             if not write_succeeded:
-                # CVE-2025-69872 (Y1): an async exception
-                # (``KeyboardInterrupt`` / ``SystemExit``) may have
-                # fired AFTER ``os.write`` deposited the full key in
-                # the kernel but BEFORE ``write_succeeded = True`` ran.
-                # Concurrent readers can already see that key, so
-                # unlinking it here would trigger
-                # ``RuntimeError: too short`` for every future
-                # process and silently change the HMAC key in any
-                # reader still holding the old bytes.  Re-read the
-                # file: if it matches the key we just generated, the
-                # write actually completed -- preserve it.
+                # CVE-2025-69872 (Y1 + L2): prefer false-positive
+                # preserve over false-negative unlink.  Stranding
+                # concurrent readers (who may already hold a valid
+                # key) is worse than leaving an incomplete file
+                # (which subsequent processes will retry past via
+                # the empty-read backoff above).  Use file size as
+                # the primary signal: only definitively-partial
+                # writes (size < len(new_key)) are unlinked; same-
+                # size files are content-verified before being
+                # claimed; larger / unknown sizes are left alone.
                 try:
-                    with open(path, 'rb') as fh:
-                        on_disk = fh.read()
-                    if on_disk == new_key:
-                        write_succeeded = True
+                    file_size = os.path.getsize(path)
                 except OSError:
-                    pass
-                if not write_succeeded:
+                    file_size = None
+                if (
+                    file_size is not None
+                    and file_size < len(new_key)
+                ):
+                    # Definitely incomplete -- safe to remove.
                     with cl.suppress(OSError):
                         os.unlink(path)
+                elif file_size == len(new_key):
+                    # Same size as ours: verify content matches the
+                    # key we generated so we don't take credit for
+                    # another process's file.
+                    try:
+                        with open(path, 'rb') as fh:
+                            if fh.read() == new_key:
+                                write_succeeded = True
+                    except OSError:
+                        pass
+                # file_size > len(new_key) or None: leave alone --
+                # someone else owns this file now, or we cannot
+                # determine its state.
 
         with cl.suppress(OSError):
             os.chmod(path, 0o600)
@@ -252,6 +265,49 @@ def _read_or_create_pickle_key_file(path):
     raise RuntimeError(
         'diskcache: failed to create pickle key file %r' % path
     )
+
+
+def _write_inherited_pickle_key_file(path, key_bytes):
+    """Atomically write ``key_bytes`` to ``path``. No-op if file already
+    exists (assumes existing content is the correct key -- caller can
+    verify if needed). Used for CVE-2025-69872 L1 recoverability:
+    child Cache instances inherit a key from a parent context (e.g.
+    FanoutCache or copy.copy) and need a recoverable key file in
+    their own directory so future processes opening the directory
+    directly can re-resolve the key via default resolution.
+    """
+    directory = op.dirname(path) or '.'
+    if not op.isdir(directory):
+        os.makedirs(directory, 0o755, exist_ok=True)
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    if hasattr(os, 'O_BINARY'):
+        flags |= os.O_BINARY
+    try:
+        fd = os.open(path, flags, 0o600)
+    except FileExistsError:
+        return  # already present (us or another process)
+    write_succeeded = False
+    try:
+        written = 0
+        while written < len(key_bytes):
+            n = os.write(fd, key_bytes[written:])
+            if n <= 0:
+                raise OSError(
+                    'diskcache: short write to inherited pickle key '
+                    'file %r' % path
+                )
+            written += n
+        write_succeeded = True
+        with cl.suppress(OSError):
+            os.fsync(fd)
+    finally:
+        with cl.suppress(OSError):
+            os.close(fd)
+        if not write_succeeded:
+            with cl.suppress(OSError):
+                os.unlink(path)
+    with cl.suppress(OSError):
+        os.chmod(path, 0o600)
 
 
 def _resolve_pickle_key_for_directory(directory, arg):
@@ -1078,6 +1134,23 @@ class Cache:
         ):
             self._disk._pickle_key_resolved = inherited_key
             self._disk._pickle_key_warned = True
+            # CVE-2025-69872 (L1): persist the inherited key into the
+            # child directory so a process that opens this directory
+            # directly later (e.g. after pickling a child Cache from
+            # FanoutCache.cache(name)) can recover the same HMAC key
+            # via default resolution -- otherwise the receiver would
+            # auto-generate a fresh random key and fail HMAC
+            # verification on the first read.  Only persist real key
+            # bytes -- not the legacy ``False`` sentinel and not
+            # short/invalid values (defensive).
+            if (
+                isinstance(inherited_key, (bytes, bytearray))
+                and len(inherited_key) >= PICKLE_KEY_MIN_LEN
+            ):
+                _write_inherited_pickle_key_file(
+                    op.join(directory, PICKLE_KEY_FILENAME),
+                    bytes(inherited_key),
+                )
 
         # Set cached attributes: updates settings and sets pragmas.
 

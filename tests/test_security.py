@@ -807,7 +807,11 @@ def test_valid_hmac_invalid_pickle_raises(tmp_cache_dir, clear_env):
     with warnings.catch_warnings():
         warnings.simplefilter('ignore', dc.UnsafePickleWarning)
         with dc.Cache(tmp_cache_dir, disk_pickle_key=key) as cache:
-            with pytest.raises((pickle.UnpicklingError, EOFError, KeyError)):
+            # CVE-2025-69872 V22: tighten -- previous version accepted
+            # KeyError, masking a regression where a corrupt HMAC-valid
+            # entry could be treated as a cache miss.  pickle/EOFError
+            # are the only legitimate outcomes here.
+            with pytest.raises((pickle.UnpicklingError, EOFError)):
                 cache['k']
 
 
@@ -1254,3 +1258,269 @@ def test_v12_bytearray_pickle_key_accepted(tmp_cache_dir, clear_env):
         with dc.Cache(tmp_cache_dir, disk_pickle_key=key) as cache:
             cache['k'] = {'v': 1}
             assert cache['k'] == {'v': 1}
+
+
+# -- Pass-4 round of fixes ---------------------------------------------
+
+
+def test_v14_short_os_write_does_not_silently_truncate(
+    tmp_cache_dir, clear_env, monkeypatch
+):
+    """V14: ``os.write`` may legally return a short write (signal,
+    quota, ENOSPC mid-write).  Ignoring the return value lets the
+    writer hold a 32-byte key in memory while the on-disk file holds
+    only a prefix; readers then see "too short" forever.
+
+    With the loop-until-full fix, a short write should either complete
+    (multiple iterations) or raise OSError that triggers cleanup.
+    """
+    from diskcache import core as dc_core
+
+    keyfile = op.join(tmp_cache_dir, PICKLE_KEY_FILENAME)
+    orig_write = os.write
+    write_count = [0]
+
+    def short_then_full_write(fd, data):
+        write_count[0] += 1
+        # First call writes 8 bytes; subsequent calls write the rest.
+        return orig_write(fd, data[:8])
+
+    monkeypatch.setattr(os, 'write', short_then_full_write)
+    key, _ = dc_core._read_or_create_pickle_key_file(keyfile)
+    monkeypatch.setattr(os, 'write', orig_write)
+
+    # The writer loop must have called os.write multiple times until
+    # all 32 bytes were durable.
+    assert write_count[0] >= 4, (
+        'expected the write loop to retry; got %d calls' % write_count[0]
+    )
+    on_disk_len = op.getsize(keyfile)
+    assert on_disk_len == len(key) == 32, (
+        'on-disk key (%d bytes) must match returned key (%d bytes)'
+        % (on_disk_len, len(key))
+    )
+
+
+def test_v14_zero_return_from_os_write_triggers_cleanup(
+    tmp_cache_dir, clear_env, monkeypatch
+):
+    """V14: a pathological 0-byte write loops forever in the naive
+    implementation; the fix raises OSError after the first such call
+    and the finally cleans up the file."""
+    from diskcache import core as dc_core
+
+    keyfile = op.join(tmp_cache_dir, PICKLE_KEY_FILENAME)
+
+    def zero_write(fd, data):
+        return 0
+
+    monkeypatch.setattr(os, 'write', zero_write)
+    with pytest.raises(OSError):
+        dc_core._read_or_create_pickle_key_file(keyfile)
+    assert not op.exists(keyfile)
+
+
+def test_v17_keyboard_interrupt_during_fsync_keeps_durable_key(
+    tmp_cache_dir, clear_env, monkeypatch
+):
+    """V17: once ``os.write`` has fully landed the key on disk,
+    concurrent readers can already see it.  A KeyboardInterrupt
+    during the subsequent fsync must NOT unlink the file -- doing so
+    would strand readers using a key that no longer exists on disk."""
+    from diskcache import core as dc_core
+
+    keyfile = op.join(tmp_cache_dir, PICKLE_KEY_FILENAME)
+
+    def kbd_during_fsync(fd):
+        raise KeyboardInterrupt('simulated Ctrl+C during fsync')
+
+    monkeypatch.setattr(os, 'fsync', kbd_during_fsync)
+    with pytest.raises(KeyboardInterrupt):
+        dc_core._read_or_create_pickle_key_file(keyfile)
+    monkeypatch.undo()
+
+    assert op.exists(keyfile), (
+        'fsync interrupt after successful os.write must NOT unlink '
+        'the key (the bytes are already visible to readers).'
+    )
+    assert op.getsize(keyfile) == 32
+
+
+def test_v18_oserror_on_realpath_propagates_when_not_path_failure(
+    tmp_cache_dir, clear_env, monkeypatch
+):
+    """V18: PermissionError / TimeoutError from realpath are real OS
+    errors, not tampering signals.  They must propagate unchanged."""
+    from diskcache import core as dc_core
+
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.Cache(tmp_cache_dir) as cache:
+            disk = cache._disk
+
+    def perm_error(*args, **kwargs):
+        raise PermissionError(13, 'Permission denied (simulated)')
+
+    monkeypatch.setattr(dc_core.op, 'realpath', perm_error)
+    with pytest.raises(PermissionError):
+        disk._safe_filename_path('ab/cd.val')
+
+
+def test_v15_copy_preserves_resolved_key_across_env_change(
+    tmp_cache_dir, clear_env, monkeypatch
+):
+    """V15: if the original Cache resolved its key from the env var
+    or in-dir file, ``copy.copy`` must propagate the resolved bytes
+    so an intervening env change does not produce a copy that uses a
+    different key."""
+    import copy
+
+    monkeypatch.setenv(PICKLE_KEY_ENV, secrets.token_bytes(32).hex())
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.Cache(tmp_cache_dir) as cache:
+            cache[('complex', 'key')] = {'v': 1}
+            # Change the env var BEFORE copying
+            monkeypatch.setenv(PICKLE_KEY_ENV, secrets.token_bytes(32).hex())
+            shallow = copy.copy(cache)
+            try:
+                # The copy must read the same value that the original
+                # wrote (resolved key was preserved).
+                assert shallow[('complex', 'key')] == {'v': 1}
+            finally:
+                shallow.close()
+
+
+def test_v16_fanout_child_cache_inherits_pickle_key(
+    tmp_cache_dir, clear_env
+):
+    """V16: ``FanoutCache.cache(name)`` must forward
+    ``disk_pickle_key`` to the child Cache.  Otherwise the child
+    auto-generates a different key and its data is unreadable when
+    the user re-opens with the parent's key."""
+    key = secrets.token_bytes(32)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.FanoutCache(
+            tmp_cache_dir, shards=2, disk_pickle_key=key
+        ) as fc:
+            child = fc.cache('child')
+            assert child._disk._pickle_key_arg == key
+            child[('complex',)] = {'v': 1}
+            # No per-child key file should exist since the key was
+            # inherited.
+            child_dir = op.join(tmp_cache_dir, 'cache', 'child')
+            assert not op.exists(op.join(child_dir, PICKLE_KEY_FILENAME))
+
+
+def test_v16_fanout_child_deque_inherits_pickle_key(
+    tmp_cache_dir, clear_env
+):
+    key = secrets.token_bytes(32)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.FanoutCache(
+            tmp_cache_dir, shards=2, disk_pickle_key=key
+        ) as fc:
+            d = fc.deque('mydeque')
+            assert d._cache._disk._pickle_key_arg == key
+            d.append({'v': 1})
+            assert d.pop() == {'v': 1}
+
+
+def test_v16_fanout_child_index_inherits_pickle_key(
+    tmp_cache_dir, clear_env
+):
+    key = secrets.token_bytes(32)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.FanoutCache(
+            tmp_cache_dir, shards=2, disk_pickle_key=key
+        ) as fc:
+            idx = fc.index('myindex')
+            assert idx._cache._disk._pickle_key_arg == key
+            idx['k'] = {'v': 1}
+            assert idx['k'] == {'v': 1}
+
+
+def test_v19_fanoutcache_copy_preserves_explicit_key(
+    tmp_cache_dir, clear_env
+):
+    """V19: same-process ``copy.copy(fanout)`` must preserve an
+    explicit key just like Cache does."""
+    import copy
+
+    key = secrets.token_bytes(32)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.FanoutCache(
+            tmp_cache_dir, shards=2, disk_pickle_key=key
+        ) as fc:
+            fc[('complex',)] = {'v': 1}
+            shallow = copy.copy(fc)
+            try:
+                assert shallow[('complex',)] == {'v': 1}
+            finally:
+                shallow.close()
+
+
+def test_v19_deque_copy_preserves_explicit_key(tmp_cache_dir, clear_env):
+    import copy
+
+    key = secrets.token_bytes(32)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        cache = dc.Cache(tmp_cache_dir, disk_pickle_key=key)
+        try:
+            deque = dc.Deque.fromcache(cache, [{'item': 1}, {'item': 2}])
+            shallow = copy.copy(deque)
+            try:
+                assert list(shallow) == [{'item': 1}, {'item': 2}]
+            finally:
+                shallow._cache.close()
+        finally:
+            cache.close()
+
+
+def test_v19_index_copy_preserves_explicit_key(tmp_cache_dir, clear_env):
+    import copy
+
+    key = secrets.token_bytes(32)
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        cache = dc.Cache(tmp_cache_dir, disk_pickle_key=key)
+        try:
+            idx = dc.Index.fromcache(cache, {'k': {'v': 1}})
+            shallow = copy.copy(idx)
+            try:
+                assert shallow['k'] == {'v': 1}
+            finally:
+                shallow._cache.close()
+        finally:
+            cache.close()
+
+
+def test_v21_legacy_error_mentions_disk_pickle_key(
+    tmp_cache_dir, clear_env
+):
+    """V21: the error must point users to ``disk_pickle_key=False``
+    (the kwarg on Cache / FanoutCache / Django OPTIONS), not
+    ``pickle_key=False`` (only valid on the Disk constructor)."""
+    # Write raw legacy pickle directly
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.Cache(tmp_cache_dir, disk_pickle_key=False) as cache:
+            cache['k'] = {'legacy': True}
+
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore', dc.UnsafePickleWarning)
+        with dc.Cache(
+            tmp_cache_dir, disk_pickle_key=secrets.token_bytes(32)
+        ) as cache:
+            with pytest.raises(pickle.UnpicklingError) as exc_info:
+                cache['k']
+    msg = str(exc_info.value)
+    assert 'disk_pickle_key' in msg, (
+        'Error must reference the public kwarg name disk_pickle_key '
+        '(not the Disk-only pickle_key); got: %r' % msg
+    )

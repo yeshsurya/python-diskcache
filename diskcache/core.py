@@ -186,13 +186,34 @@ def _read_or_create_pickle_key_file(path):
         # so we clean up the half-baked file even on KeyboardInterrupt /
         # SystemExit (otherwise an empty file blocks every subsequent
         # process with a "too short" RuntimeError until manually removed).
+        #
+        # CVE-2025-69872 V14: ``os.write`` may legally return fewer bytes
+        # than requested (signal interruption, disk quota, ENOSPC mid-
+        # write).  Loop until the full key is on disk, otherwise the
+        # writer holds a 32-byte key in memory while readers see only a
+        # truncated prefix.
+        #
+        # CVE-2025-69872 V17: set ``write_succeeded`` IMMEDIATELY after
+        # the bytes hit the kernel (before fsync), not after fsync.
+        # Once ``os.write`` has returned, concurrent readers can already
+        # see the full key; if a KeyboardInterrupt then cancels fsync we
+        # must NOT unlink the file -- doing so leaves those readers
+        # using a key that is no longer recoverable from disk.
+        new_key = secrets.token_bytes(32)
         write_succeeded = False
         try:
-            new_key = secrets.token_bytes(32)
-            os.write(fd, new_key)
+            written = 0
+            while written < len(new_key):
+                n = os.write(fd, new_key[written:])
+                if n <= 0:
+                    raise OSError(
+                        'diskcache: os.write returned %d while writing '
+                        'pickle key file %r' % (n, path)
+                    )
+                written += n
+            write_succeeded = True
             with cl.suppress(OSError):
                 os.fsync(fd)
-            write_succeeded = True
         finally:
             with cl.suppress(OSError):
                 os.close(fd)
@@ -468,7 +489,8 @@ class Disk:
         raise pickle.UnpicklingError(
             'diskcache: pickle envelope missing; this cache entry '
             'predates the CVE-2025-69872 mitigation. Pass '
-            'pickle_key=False to read legacy data (insecure), or '
+            'disk_pickle_key=False to Cache / FanoutCache (or Django '
+            'CACHES OPTIONS) to read legacy data (insecure), or '
             'recreate the cache.'
         )
 
@@ -639,12 +661,16 @@ class Disk:
                 'diskcache: cache filename must be str, got %s'
                 % type(filename).__name__
             )
-        # Cache realpath of the directory once (CVE-2025-69872 perf).
+        # CVE-2025-69872: only translate OSError subclasses that
+        # plausibly indicate a malformed / tampered filename.  Genuine
+        # operational errors (PermissionError, TimeoutError) propagate
+        # so callers can distinguish them from path traversal attempts.
+        # Cache realpath of the directory once (V6 perf).
         base = self._directory_realpath
         if base is None:
             try:
                 base = op.realpath(self._directory)
-            except OSError as exc:
+            except (FileNotFoundError, NotADirectoryError) as exc:
                 raise ValueError(
                     'diskcache: cannot resolve cache directory %r (%s)'
                     % (self._directory, exc)
@@ -652,15 +678,24 @@ class Disk:
             self._directory_realpath = base
         try:
             full = op.realpath(op.join(self._directory, filename))
-        except OSError as exc:
-            # CVE-2025-69872: translate platform-specific resolution
-            # failures (e.g. Windows UNC ``\\server\\share`` raising
-            # FileNotFoundError) into the documented ValueError so
-            # callers do not have to catch OSError separately.
+        except (FileNotFoundError, NotADirectoryError) as exc:
             raise ValueError(
                 'diskcache: cannot resolve cache filename %r (%s; '
                 'cache.db may be tampered)' % (filename, exc)
             ) from exc
+        except OSError as exc:
+            # Windows-only: UNC / drive-not-found surface as bare
+            # OSError or WinError 53 / 67 / 87 / 123 / 161 (path/name
+            # invalid for filesystem use).  Treat as malformed
+            # filename; let other OSError subclasses propagate.
+            if os.name == 'nt' and getattr(exc, 'winerror', None) in (
+                53, 67, 87, 123, 161, 1001
+            ):
+                raise ValueError(
+                    'diskcache: cannot resolve cache filename %r (%s; '
+                    'cache.db may be tampered)' % (filename, exc)
+                ) from exc
+            raise
         if full != base and not full.startswith(base + os.sep):
             raise ValueError(
                 'diskcache: cache filename %r escapes cache directory '
@@ -2897,12 +2932,25 @@ class Cache:
             # Forward bytes / False explicitly so the new instance has
             # the same security posture as the original.
             kwargs['disk_pickle_key'] = arg
-        return self.__class__(
+        new = self.__class__(
             self.directory,
             timeout=self.timeout,
             disk=type(self.disk),
             **kwargs,
         )
+        # CVE-2025-69872 V15: if the original has already lazily
+        # resolved its HMAC key from env / file, propagate the
+        # resolved bytes to the copy so an intervening change to
+        # ``DISKCACHE_PICKLE_KEY`` or ``.diskcache_pickle_key`` does
+        # not produce a copy that uses a different key than the
+        # original (which would silently fail HMAC verification).
+        if (
+            arg is _PICKLE_KEY_UNSET
+            and getattr(disk, '_pickle_key_resolved', None) is not None
+        ):
+            new._disk._pickle_key_resolved = disk._pickle_key_resolved
+            new._disk._pickle_key_warned = True
+        return new
 
     def reset(self, key, value=ENOVAL, update=True):
         """Reset `key` and `value` item from Settings table.

@@ -675,6 +675,12 @@ class FanoutCache:
         except KeyError:
             parts = name.split('/')
             directory = op.join(self._directory, 'cache', *parts)
+            # CVE-2025-69872 V16: forward the FanoutCache's resolved
+            # pickle key to the child cache so it doesn't auto-
+            # generate its own (different) ``.diskcache_pickle_key``
+            # under the child directory.  Caller-supplied settings
+            # win on conflict.
+            self._inject_disk_pickle_key(settings)
             temp = Cache(
                 directory=directory,
                 timeout=timeout,
@@ -709,10 +715,13 @@ class FanoutCache:
         except KeyError:
             parts = name.split('/')
             directory = op.join(self._directory, 'deque', *parts)
+            child_kwargs = {}
+            self._inject_disk_pickle_key(child_kwargs)
             cache = Cache(
                 directory=directory,
                 disk=self._disk,
                 eviction_policy='none',
+                **child_kwargs,
             )
             deque = Deque.fromcache(cache, maxlen=maxlen)
             _deques[name] = deque
@@ -745,14 +754,64 @@ class FanoutCache:
         except KeyError:
             parts = name.split('/')
             directory = op.join(self._directory, 'index', *parts)
+            child_kwargs = {}
+            self._inject_disk_pickle_key(child_kwargs)
             cache = Cache(
                 directory=directory,
                 disk=self._disk,
                 eviction_policy='none',
+                **child_kwargs,
             )
             index = Index.fromcache(cache)
             _indexes[name] = index
             return index
+
+    def _inject_disk_pickle_key(self, kwargs):
+        """CVE-2025-69872 V16 helper: forward the FanoutCache's
+        resolved pickle key to a child Cache constructor's kwargs so
+        the child does not run an independent default-fallback
+        resolution (which would create a separate
+        ``.diskcache_pickle_key`` file under the child directory and,
+        critically, would use a *different* HMAC key than the parent
+        and its sibling shards).
+        """
+        if 'disk_pickle_key' in kwargs:
+            return  # caller-supplied wins
+        # Prefer the user's explicit argument (so the child uses
+        # exactly the same secret).  Fall back to the resolved key on
+        # shard 0 (which the FanoutCache resolved at construction
+        # time and shared with every shard).
+        arg = self._pickle_key_user_arg
+        if arg is not _PICKLE_KEY_UNSET and arg is not None:
+            kwargs['disk_pickle_key'] = arg
+            return
+        if self._shards:
+            shard_arg = self._shards[0]._disk._pickle_key_arg
+            if shard_arg is not _PICKLE_KEY_UNSET and shard_arg is not None:
+                kwargs['disk_pickle_key'] = shard_arg
+
+    def __copy__(self):
+        return self._copy_for_same_process()
+
+    def __deepcopy__(self, memo):
+        return self._copy_for_same_process()
+
+    def _copy_for_same_process(self):
+        # CVE-2025-69872 V19: same-process copy preserves the user's
+        # explicit pickle_key (or False) so a copied FanoutCache stays
+        # in the same security mode as the original.  Default-mode
+        # FanoutCaches re-resolve via env / file in the new instance.
+        kwargs = {}
+        arg = self._pickle_key_user_arg
+        if arg is not _PICKLE_KEY_UNSET:
+            kwargs['disk_pickle_key'] = arg
+        return self.__class__(
+            self._directory,
+            shards=self._count,
+            timeout=self.timeout,
+            disk=self._disk,
+            **kwargs,
+        )
 
 
 FanoutCache.memoize = Cache.memoize  # type: ignore

@@ -350,6 +350,23 @@ class Deque(Sequence):
         directory, maxlen = state
         self.__init__(directory=directory, maxlen=maxlen)
 
+    def __copy__(self):
+        return self._copy_for_same_process()
+
+    def __deepcopy__(self, memo):
+        return self._copy_for_same_process()
+
+    def _copy_for_same_process(self):
+        # CVE-2025-69872 V19: same-process Deque copy preserves the
+        # underlying Cache's explicit pickle_key so the copy stays
+        # readable.  Default-mode caches re-resolve from env / file.
+        cache = self._cache
+        arg = getattr(cache._disk, '_pickle_key_arg', _PICKLE_KEY_UNSET)
+        if arg is not _PICKLE_KEY_UNSET and arg is not None:
+            new_cache = Cache(self.directory, disk_pickle_key=arg)
+            return type(self).fromcache(new_cache, maxlen=self.maxlen)
+        return type(self)(directory=self.directory, maxlen=self.maxlen)
+
     def append(self, value):
         """Add `value` to back of deque.
 
@@ -1120,6 +1137,22 @@ class Index(MutableMapping):
 
     def __setstate__(self, state):
         self.__init__(state)
+
+    def __copy__(self):
+        return self._copy_for_same_process()
+
+    def __deepcopy__(self, memo):
+        return self._copy_for_same_process()
+
+    def _copy_for_same_process(self):
+        # CVE-2025-69872 V19: same-process Index copy preserves the
+        # underlying Cache's explicit pickle_key.
+        cache = self._cache
+        arg = getattr(cache._disk, '_pickle_key_arg', _PICKLE_KEY_UNSET)
+        if arg is not _PICKLE_KEY_UNSET and arg is not None:
+            new_cache = Cache(self.directory, disk_pickle_key=arg)
+            return type(self).fromcache(new_cache)
+        return type(self)(self.directory)
 
     def __eq__(self, other):
         """index.__eq__(other) <==> index == other
